@@ -25,7 +25,7 @@ class TestAgeOutWatch(WatchmanTestCase.WatchmanTestCase):
             'command': ['true']})
 
         # wait long enough for the reap to be considered
-        time.sleep(2)
+        time.sleep(10)
 
         watch_list = self.watchmanCommand('watch-list')
         self.assertEqual(self.normFileList(watch_list['roots']), [root])

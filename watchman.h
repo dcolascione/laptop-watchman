@@ -400,7 +400,7 @@ struct watchman_query_cookie {
 
 #define WATCHMAN_IO_BUF_SIZE 1048576
 #define WATCHMAN_BATCH_LIMIT (16*1024)
-#define DEFAULT_SETTLE_PERIOD 20
+#define DEFAULT_SETTLE_PERIOD 2000
 
 /* Prune out nodes that were deleted roughly 12-36 hours ago */
 #define DEFAULT_GC_AGE (86400/2)
