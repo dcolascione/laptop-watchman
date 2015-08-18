@@ -96,6 +96,10 @@ extern char **environ;
 # define PRIsize_t "zu"
 #endif
 
+#ifndef _WIN32
+# include <wordexp.h>
+#endif
+
 extern char *poisoned_reason;
 
 #include "watchman_hash.h"

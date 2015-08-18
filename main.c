@@ -30,6 +30,8 @@ static struct sockaddr_un un;
 #endif
 static int json_input_arg = 0;
 
+static char *state_dir = NULL;
+
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -383,8 +385,160 @@ static const char *get_env_with_fallback(const char *name1,
   return val;
 }
 
+static const char *get_state_dir(void)
+{
+  if (!state_dir) {
+    const char *state_dir_template;
+    char *expanded_state_dir;
+    struct stat statbuf;
+    int stat_ret;
+
+    state_dir_template = getenv("WATCHMAN_STATE_DIR");
+    if (!state_dir_template) {
+      state_dir_template = WATCHMAN_STATE_DIR;
+    }
+
+#ifdef _WIN32
+    {
+      DWORD ret;
+      DWORD len = ExpandEnvironmentStrings(state_dir_template, NULL, 0);
+      if (len == 0) {
+        w_log(W_LOG_ERR, "ExpandEnvironmentStrings failed");
+        exit(1);
+      }
+
+      expanded_state_dir = malloc(len);
+      if (expanded_state_dir == NULL) {
+        w_log(W_LOG_ERR, "out of memory");
+        exit(1);
+      }
+
+      ret = ExpandEnvironmentStrings(
+        state_dir_template,
+        expanded_state_dir,
+        len);
+
+      if (ret == 0 || ret > len) {
+        w_log(W_LOG_ERR, "ExpandEnvironmentStrings weirdness");
+        exit(1);
+      }
+    }
+#else
+    {
+      char *old_ifs;
+      int we_flags = WRDE_UNDEF;
+      wordexp_t p;
+      memset(&p, 0, sizeof (p));
+
+      // Prevent word expansion in wordexp
+      old_ifs = getenv("IFS");
+      if (setenv("IFS", "", 1) != 0) {
+        w_log(W_LOG_ERR, "setenv failed");
+        exit(1);
+      }
+
+      switch (wordexp(state_dir_template, &p, we_flags)) {
+        case 0:
+          break; // Success
+        case WRDE_BADCHAR:
+          w_log(W_LOG_ERR,
+                "bad character in state directory template %s",
+                state_dir_template);
+          exit(1);
+        case WRDE_BADVAL:
+          w_log(W_LOG_ERR,
+                "undefined variable in state directory template %s",
+                state_dir_template);
+          exit(1);
+        case WRDE_CMDSUB:
+          w_log(W_LOG_ERR, "command substitution not supported");
+          exit(1);
+        case WRDE_NOSPACE:
+          w_log(W_LOG_ERR, "out of memory");
+          exit(1);
+        case WRDE_SYNTAX:
+          w_log(W_LOG_ERR, "shell syntax error");
+          exit(1);
+        default:
+          w_log(W_LOG_ERR, "unknown error in wordexp");
+          exit(1);
+      }
+
+      if (old_ifs) {
+        setenv("IFS", old_ifs, 1);
+      } else {
+        unsetenv("IFS");
+      }
+
+      if (p.we_wordc != 1) {
+        w_log(W_LOG_ERR, "word expansion unexpectedly split path");
+        exit(1);
+      }
+
+      expanded_state_dir = strdup(p.we_wordv[0]);
+      if (expanded_state_dir == NULL) {
+        w_log(W_LOG_ERR, "out of memory");
+        exit(1);
+      }
+
+      wordfree(&p);
+    }
+#endif
+
+    stat_ret = stat(expanded_state_dir, &statbuf);
+    if (stat_ret == 0 && !S_ISDIR(statbuf.st_mode)) {
+      w_log(W_LOG_ERR,
+            "state directory %s is not a directory",
+            expanded_state_dir);
+      exit(1);
+    }
+
+    if (stat_ret == -1 && errno != ENOENT && errno != ENOTDIR) {
+      w_log(W_LOG_ERR, "stat of %s failed: %s",
+            expanded_state_dir,
+            strerror(errno));
+      exit(1);
+    }
+
+    if (stat_ret == -1) {
+      // Make sure all elements in the state directory path exist.
+      // Easier to shell out than iterate over the path elements,
+      // especially on Windows with its myriad path syntaxes.
+      char *mkdir_command = NULL;
+      w_string_t *state_dir_s = w_string_new(expanded_state_dir);
+      w_string_t *escaped_state_dir = w_string_shell_escape(state_dir_s);
+      ignore_result(
+        asprintf(&mkdir_command,
+#ifdef _WIN32
+                 "mkdir %s",
+#else
+                 "mkdir -p %s",
+#endif
+                 escaped_state_dir->buf));
+
+      w_string_delref(state_dir_s);
+      w_string_delref(escaped_state_dir);
+
+      if (mkdir_command == NULL) {
+        w_log(W_LOG_ERR, "creating mkdir command failed");
+        exit(1);
+      }
+
+      if (system(mkdir_command) != 0) {
+        w_log(W_LOG_ERR, "mkdir command \"%s\" failed", mkdir_command);
+        exit(1);
+      }
+
+      free(mkdir_command);
+    }
+
+    state_dir = expanded_state_dir;
+  }
+
+  return state_dir;
+}
+
 static void compute_file_name(char **strp,
-    const char *user,
     const char *suffix,
     const char *what)
 {
@@ -393,24 +547,11 @@ static void compute_file_name(char **strp,
   str = *strp;
 
   if (!str) {
-#ifdef WATCHMAN_STATE_DIR
-    /* avoid redundant naming if they picked something like
-     * "/var/watchman" */
-    ignore_result(asprintf(&str, "%s%c%s%s%s",
-          WATCHMAN_STATE_DIR,
+    ignore_result(asprintf(&str, "%s%cwatchman%s%s",
+          get_state_dir(),
           WATCHMAN_DIR_SEP,
-          user,
           suffix[0] ? "." : "",
           suffix));
-#else
-    ignore_result(asprintf(&str, "%s%c%cwatchman.%s%s%s",
-          watchman_tmp_dir,
-          WATCHMAN_DIR_SEP,
-          WATCHMAN_DIR_DOT,
-          user,
-          suffix[0] ? "." : "",
-          suffix));
-#endif
   }
 
   if (!str) {
@@ -421,7 +562,7 @@ static void compute_file_name(char **strp,
 #ifndef _WIN32
   if (str[0] != '/') {
     w_log(W_LOG_ERR, "invalid %s: %s", what, str);
-    abort();
+    exit(1);
   }
 #endif
 
@@ -430,53 +571,25 @@ static void compute_file_name(char **strp,
 
 static void setup_sock_name(void)
 {
-  const char *user = get_env_with_fallback("USER", "LOGNAME", NULL);
-#ifdef _WIN32
-  char user_buf[256];
-#endif
-
   watchman_tmp_dir = get_env_with_fallback("TMPDIR", "TMP", "/tmp");
-
-  if (!user) {
-#ifdef _WIN32
-    DWORD size = sizeof(user_buf);
-    if (GetUserName(user_buf, &size)) {
-      user_buf[size] = 0;
-      user = user_buf;
-    } else {
-      w_log(W_LOG_FATAL, "GetUserName failed: %s. I don't know who you are\n",
-          win32_strerror(GetLastError()));
-    }
-#else
-    uid_t uid = getuid();
-    struct passwd *pw;
-
-    pw = getpwuid(uid);
-    if (!pw) {
-      w_log(W_LOG_FATAL, "getpwuid(%d) failed: %s. I don't know who you are\n",
-          uid, strerror(errno));
-    }
-
-    user = pw->pw_name;
-#endif
-
-    if (!user) {
-      w_log(W_LOG_ERR, "watchman requires that you set $USER in your env\n");
-      abort();
-    }
-  }
 
 #ifdef _WIN32
   if (!sock_name) {
-    asprintf(&sock_name, "\\\\.\\pipe\\watchman-%s", user);
+    char* username = getenv("USERNAME");
+    if (!username) {
+      w_log(W_LOG_ERR, "USERNAME not set in environment");
+      abort();
+    }
+
+    asprintf(&sock_name, "\\\\.\\pipe\\watchman-%s", username);
   }
 #else
-  compute_file_name(&sock_name, user, "", "sockname");
+  compute_file_name(&sock_name, "", "sockname");
 #endif
-  compute_file_name(&watchman_state_file, user, "state", "statefile");
-  compute_file_name(&log_name, user, "log", "logname");
+  compute_file_name(&watchman_state_file, "state", "statefile");
+  compute_file_name(&log_name, "log", "logname");
 #ifdef USE_GIMLI
-  compute_file_name(&pid_file, user, "pid", "pidfile");
+  compute_file_name(&pid_file, "pid", "pidfile");
 #endif
 
 #ifndef _WIN32
