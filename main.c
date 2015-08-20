@@ -619,6 +619,7 @@ static bool try_command(json_t *cmd, int timeout)
 {
   w_stm_t client = NULL;
   w_jbuffer_t buffer;
+  w_jbuffer_t output_pdu_buffer;
   int err;
 
   client = w_stm_connect(sock_name, timeout * 1000);
@@ -645,16 +646,21 @@ static bool try_command(json_t *cmd, int timeout)
 
   w_json_buffer_reset(&buffer);
 
+  w_json_buffer_init(&output_pdu_buffer);
+
   do {
-    if (!w_json_buffer_passthru(&buffer, output_pdu, client)) {
+    if (!w_json_buffer_passthru(
+          &buffer, output_pdu, &output_pdu_buffer, client)) {
       err = errno;
       w_json_buffer_free(&buffer);
+      w_json_buffer_free(&output_pdu_buffer);
       w_stm_close(client);
       errno = err;
       return false;
     }
   } while (persistent);
   w_json_buffer_free(&buffer);
+  w_json_buffer_free(&output_pdu_buffer);
   w_stm_close(client);
 
   return true;
@@ -778,6 +784,12 @@ int main(int argc, char **argv)
 {
   bool ran;
   json_t *cmd;
+  pthread_mutexattr_t mattr;
+
+  pthread_mutexattr_init(&mattr);
+  pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&w_client_lock, &mattr);
+  pthread_mutexattr_destroy(&mattr);
 
   parse_cmdline(&argc, &argv);
 

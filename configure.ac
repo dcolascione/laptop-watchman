@@ -221,6 +221,12 @@ AC_CONFIG_HEADER([config.h])
 AC_CONFIG_FILES([Makefile thirdparty/jansson/jansson_config.h])
 AC_OUTPUT
 
+if test "$WATCHMAN_STATE_DIR" != "no"; then
+  reported_state_directory="$WATCHMAN_STATE_DIR"
+else
+  reported_state_directory="System temporary directory"
+fi
+
 cat << EOF
 
 Your build configuration:

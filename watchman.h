@@ -419,6 +419,8 @@ struct watchman_root {
   /* our locking granularity is per-root */
   pthread_mutex_t lock;
   pthread_t notify_thread;
+  pthread_t io_thread;
+  w_evt_t have_pending_evt;
 
   /* map of rule id => struct watchman_trigger_command */
   w_ht_t *commands;
@@ -516,6 +518,7 @@ void w_json_buffer_free(w_jbuffer_t *jr);
 json_t *w_json_buffer_next(w_jbuffer_t *jr, w_stm_t stm, json_error_t *jerr);
 bool w_json_buffer_passthru(w_jbuffer_t *jr,
     enum w_pdu_type output_pdu,
+    w_jbuffer_t *output_pdu_buf,
     w_stm_t stm);
 bool w_json_buffer_write(w_jbuffer_t *jr, w_stm_t stm, json_t *json, int flags);
 bool w_json_buffer_write_bser(w_jbuffer_t *jr, w_stm_t stm, json_t *json);
@@ -531,7 +534,7 @@ json_t *bunser(const char *buf, const char *end,
     json_int_t *needed, json_error_t *jerr);
 
 struct watchman_client_response {
-  struct watchman_client_response *next, *prev;
+  struct watchman_client_response *next;
   json_t *json;
 };
 
@@ -548,8 +551,6 @@ struct watchman_client {
   struct watchman_client_response *head, *tail;
   /* map of subscription name => struct watchman_client_subscription */
   w_ht_t *subscriptions;
-
-  pthread_mutex_t lock;
 };
 extern pthread_mutex_t w_client_lock;
 extern w_ht_t *clients;
