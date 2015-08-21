@@ -1,23 +1,18 @@
-# Watchman
+# Laptop-Watchman
 
-A file watching service.
+A fork of the watchman file-monitoring service optimized for laptops.
+
+## Differences from facebook/watchman
+
+- Secure management of state directory
+
+- Better energy efficiency: no sub-second-frequency wakeups when there
+  is nothing to do
 
 ## Purpose
 
 Watchman exists to watch files and record when they actually change.  It can
 also trigger actions (such as rebuilding assets) when matching files change.
-
-## Documentation
-
-Head on over to https://facebook.github.io/watchman/
-
-## Build Status
-
-[![Build Status](https://travis-ci.org/facebook/watchman.svg?branch=master)
-](https://travis-ci.org/facebook/watchman)
-
-[![Build status](https://ci.appveyor.com/api/projects/status/uvafoyc550kg438h/branch/master?svg=true)
-](https://ci.appveyor.com/project/wez/watchman/branch/master)
 
 ## License
 
