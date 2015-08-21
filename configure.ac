@@ -31,7 +31,14 @@ dnl Look for "arc" so that we can conditionally enable more pedantry
 dnl when building.  We prefer that contributors use "arc" but don't
 dnl require users to have it to build and use watchman
 AC_CHECK_PROG(HAVE_ARC, arc, yes, no)
-AM_CONDITIONAL(HAVE_ARC, test "x$HAVE_ARC" = xyes)
+
+arclint=1
+AC_ARG_ENABLE(arclint, [
+  --disable-arclint       Skip running arc lint on build.
+],[
+  arclint=$enableval
+])
+AM_CONDITIONAL(ARCLINT, test "$arclint" != "no" && test "$HAVE_ARC" = "yes")
 
 dnl I don't care that this is supposed to be sysconfdir; autoconf doesn't
 dnl allow it to be evaluated sanely from configure, only via Makefile,

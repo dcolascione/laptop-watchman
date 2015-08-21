@@ -98,7 +98,7 @@ WILDMATCH_LIB = libwildmatch.a
 TESTS = tests/argv.t tests/log.t tests/bser.t tests/wildmatch.t
 noinst_PROGRAMS = tests/argv.t tests/log.t tests/bser.t tests/wildmatch.t
 
-if HAVE_ARC
+if ARCLINT
 # Run lint and output stuff suitable for feeding into ":make" in vim
 # quickfix mode.
 lint:
