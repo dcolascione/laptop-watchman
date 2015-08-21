@@ -82,28 +82,39 @@ static const struct watchman_hash_funcs dirname_hash_funcs = {
   delete_dir
 };
 
-static void load_root_config(w_root_t *root, const char *path)
+static bool load_root_config_1(w_root_t *root,
+                               const char *path,
+                               const char* cfgbasename)
 {
   char cfgfilename[WATCHMAN_NAME_MAX];
   json_error_t err;
 
-  snprintf(cfgfilename, sizeof(cfgfilename), "%s%c.watchmanconfig",
-      path, WATCHMAN_DIR_SEP);
+  snprintf(cfgfilename, sizeof(cfgfilename), "%s%c%s",
+           path, WATCHMAN_DIR_SEP, cfgbasename);
 
   if (!w_path_exists(cfgfilename)) {
     if (errno == ENOENT) {
-      return;
+      return false;
     }
     w_log(W_LOG_ERR, "%s is not accessible: %s\n",
         cfgfilename, strerror(errno));
-    return;
+    return false;
   }
 
   root->config_file = json_load_file(cfgfilename, 0, &err);
   if (!root->config_file) {
     w_log(W_LOG_ERR, "failed to parse json from %s: %s\n",
         cfgfilename, err.text);
+    return false;
   }
+
+  return true;
+}
+
+static void load_root_config(w_root_t *root, const char *path)
+{
+  load_root_config_1(root, path, ".watchmanconfig.local") ||
+    load_root_config_1(root, path, ".watchmanconfig");
 }
 
 static size_t root_init_offset = offsetof(w_root_t, _init_sentinel_);
