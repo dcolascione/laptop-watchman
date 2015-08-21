@@ -259,11 +259,6 @@ static void spawn_via_launchd(void)
       waitpid(pid, &res, 0);
     }
     posix_spawnattr_destroy(&attr);
-
-    // Forcibly remove the plist.  In some cases it may have some attributes
-    // set that prevent launchd from loading it.  This can happen where
-    // the system was re-imaged or restored from a backup
-    unlink(plist_path);
   }
 
   fp = fopen(plist_path, "w");
@@ -298,8 +293,6 @@ static void spawn_via_launchd(void)
 "        <dict>\n"
 "            <key>SockPathName</key>\n"
 "            <string>%s</string>\n"
-"            <key>SockPathMode</key>\n"
-"            <integer>%d</integer>\n"
 "        </dict>\n"
 "    </dict>\n"
 "    <key>KeepAlive</key>\n"
@@ -317,7 +310,7 @@ static void spawn_via_launchd(void)
 "</dict>\n"
 "</plist>\n",
     watchman_path, log_name, log_level, sock_name,
-    watchman_state_file, sock_name, 0600,
+    watchman_state_file, sock_name,
     getenv("PATH"));
   fclose(fp);
   // Don't rely on umask, ensure we have the correct perms
@@ -555,21 +548,15 @@ static void compute_file_name(char **strp,
 
   if (!str) {
     ignore_result(asprintf(&str, "%s%cwatchman%s%s",
-          get_state_dir(),
-          WATCHMAN_DIR_SEP,
-          suffix[0] ? "." : "",
-          suffix));
+                           get_state_dir(),
+                           WATCHMAN_DIR_SEP,
+                           suffix[0] ? "." : "",
+                           suffix));
   }
 
-    ignore_result(asprintf(&str, "%s%c%s",
-          state_dir, WATCHMAN_DIR_SEP, suffix));
-
-    if (!str) {
-      w_log(W_LOG_ERR, "out of memory computing %s", what);
-      abort();
-    }
-
-    free(state_dir);
+  if (!str) {
+    w_log(W_LOG_ERR, "out of memory computing %s", what);
+    abort();
   }
 
 #ifndef _WIN32
