@@ -55,7 +55,7 @@ AC_ARG_WITH(buildinfo, [
  AC_DEFINE_UNQUOTED(WATCHMAN_BUILD_INFO, "$withval", [build info])
 ])
 
-WATCHMAN_STATE_DIR="\$HOME/.watchman/\$(hostname)"
+WATCHMAN_STATE_DIR="\$HOME/.watchman"
 AC_ARG_WITH(statedir, [
   --with-statedir=PATH  Use PATH as the default for state, log files
                         and sockets instead of using your system tempdir.
