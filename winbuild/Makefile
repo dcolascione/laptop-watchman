@@ -42,8 +42,10 @@ SRCS=\
 	log.c        \
 	json.c       \
 	bser.c       \
+	expflags.c   \
 	hash.c       \
 	ioprio.c     \
+	pending.c    \
 	stream.c     \
 	stream_win.c \
 	stream_stdout.c \

@@ -221,22 +221,6 @@ struct watchman_string {
   const char *buf;
 };
 
-#ifndef IN_EXCL_UNLINK
-/* defined in <linux/inotify.h> but we can't include that without
- * breaking userspace */
-# define WATCHMAN_IN_EXCL_UNLINK 0x04000000
-#else
-# define WATCHMAN_IN_EXCL_UNLINK IN_EXCL_UNLINK
-#endif
-
-#define WATCHMAN_INOTIFY_MASK \
-  IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | \
-  IN_DELETE_SELF | IN_MODIFY | IN_MOVE_SELF | IN_MOVED_FROM | \
-  IN_MOVED_TO | IN_DONT_FOLLOW | IN_ONLYDIR | WATCHMAN_IN_EXCL_UNLINK
-
-#define WATCHMAN_PORT_EVENTS \
-  FILE_MODIFIED | FILE_ATTRIB | FILE_NOFOLLOW
-
 /* small for testing, but should make this greater than the number of dirs we
  * have in our repos to avoid realloc */
 #define HINT_NUM_DIRS 128*1024
@@ -274,6 +258,34 @@ struct watchman_pending_fs {
   bool via_notify;
 };
 
+struct watchman_pending_collection {
+  struct watchman_pending_fs *pending;
+  w_ht_t *pending_uniq;
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  bool pinged;
+};
+
+bool w_pending_coll_init(struct watchman_pending_collection *coll);
+void w_pending_coll_destroy(struct watchman_pending_collection *coll);
+void w_pending_coll_drain(struct watchman_pending_collection *coll);
+void w_pending_coll_lock(struct watchman_pending_collection *coll);
+void w_pending_coll_unlock(struct watchman_pending_collection *coll);
+bool w_pending_coll_add(struct watchman_pending_collection *coll,
+    w_string_t *path, bool recursive, struct timeval now, bool via_notify);
+bool w_pending_coll_add_rel(struct watchman_pending_collection *coll,
+    struct watchman_dir *dir, const char *name, bool recursive,
+    struct timeval now, bool via_notify);
+void w_pending_coll_append(struct watchman_pending_collection *target,
+    struct watchman_pending_collection *src);
+struct watchman_pending_fs *w_pending_coll_pop(
+    struct watchman_pending_collection *coll);
+bool w_pending_coll_lock_and_wait(struct watchman_pending_collection *coll,
+    int timeoutms);
+void w_pending_coll_ping(struct watchman_pending_collection *coll);
+uint32_t w_pending_coll_size(struct watchman_pending_collection *coll);
+void w_pending_fs_free(struct watchman_pending_fs *p);
+
 struct watchman_dir {
   /* full path */
   w_string_t *path;
@@ -283,12 +295,6 @@ struct watchman_dir {
   w_ht_t *lc_files;
   /* child dirs contained in this dir (keyed by dir->path) */
   w_ht_t *dirs;
-
-  /* watch descriptor */
-  int wd;
-#if HAVE_PORT_CREATE
-  file_obj_t port_file;
-#endif
 };
 
 struct watchman_ops {
@@ -345,7 +351,7 @@ struct watchman_ops {
   // Consume any available notifications.  If there are none pending,
   // does not block.
   bool (*root_consume_notify)(watchman_global_watcher_t watcher,
-      w_root_t *root);
+      w_root_t *root, struct watchman_pending_collection *coll);
 
   // Wait for an inotify event to become available
   bool (*root_wait_notify)(watchman_global_watcher_t watcher,
@@ -383,13 +389,6 @@ struct watchman_file {
   /* cache stat results so we can tell if an entry
    * changed */
   struct stat st;
-
-#if HAVE_PORT_CREATE
-  file_obj_t port_file;
-#endif
-#if HAVE_KQUEUE
-  int kq_fd;
-#endif
 };
 
 #define WATCHMAN_COOKIE_PREFIX ".watchman-cookie-"
@@ -420,7 +419,6 @@ struct watchman_root {
   pthread_mutex_t lock;
   pthread_t notify_thread;
   pthread_t io_thread;
-  w_evt_t have_pending_evt;
 
   /* map of rule id => struct watchman_trigger_command */
   w_ht_t *commands;
@@ -453,6 +451,9 @@ struct watchman_root {
   // Last ad-hoc warning message
   w_string_t *warning;
 
+  /* queue of items that we need to stat/process */
+  struct watchman_pending_collection pending;
+
   /* --- everything below this point will be reset on w_root_init --- */
   bool _init_sentinel_;
 
@@ -464,10 +465,6 @@ struct watchman_root {
 
   /* map of dir name to a dir */
   w_ht_t *dirname_to_dir;
-
-  /* queue of items that we need to stat/process */
-  struct watchman_pending_fs *pending;
-  w_ht_t *pending_uniq;
 
   /* the most recently changed file */
   struct watchman_file *latest_file;
@@ -582,6 +579,7 @@ bool w_should_log_to_clients(int level);
 void w_log_to_clients(int level, const char *buf);
 
 bool w_is_ignored(w_root_t *root, const char *path, uint32_t pathlen);
+void w_timeoutms_to_abs_timespec(int timeoutms, struct timespec *deadline);
 
 w_string_t *w_string_new(const char *str);
 #ifdef _WIN32
@@ -638,19 +636,16 @@ void w_root_set_warning(w_root_t *root, w_string_t *str);
 
 struct watchman_dir *w_root_resolve_dir(w_root_t *root,
     w_string_t *dir_name, bool create);
-struct watchman_dir *w_root_resolve_dir_by_wd(w_root_t *root, int wd);
-void w_root_process_path(w_root_t *root, w_string_t *full_path,
+void w_root_process_path(w_root_t *root,
+    struct watchman_pending_collection *coll, w_string_t *full_path,
     struct timeval now, bool recursive, bool via_notify);
-bool w_root_process_pending(w_root_t *root, bool drain);
+bool w_root_process_pending(w_root_t *root,
+    struct watchman_pending_collection *coll,
+    bool pull_from_root);
 
 void w_root_mark_file_changed(w_root_t *root, struct watchman_file *file,
     struct timeval now);
 
-bool w_root_add_pending(w_root_t *root, w_string_t *path,
-    bool recursive, struct timeval now, bool via_notify);
-bool w_root_add_pending_rel(w_root_t *root, struct watchman_dir *dir,
-    const char *name, bool recursive,
-    struct timeval now, bool via_notify);
 bool w_root_sync_to_now(w_root_t *root, int timeoutms);
 
 void w_root_lock(w_root_t *root);
@@ -926,7 +921,7 @@ void w_assess_trigger(w_root_t *root, struct watchman_trigger_command *cmd);
 struct watchman_trigger_command *w_build_trigger_from_def(
   w_root_t *root, json_t *trig, char **errmsg);
 
-void set_poison_state(w_root_t *root, struct watchman_dir *dir,
+void set_poison_state(w_root_t *root, w_string_t *dir,
     struct timeval now, const char *syscall, int err,
     const char *reason);
 
@@ -947,6 +942,13 @@ extern struct watchman_ops win32_watcher;
 
 void w_ioprio_set_low(void);
 void w_ioprio_set_normal(void);
+
+struct flag_map {
+  uint32_t value;
+  const char *label;
+};
+void w_expand_flags(const struct flag_map *fmap, uint32_t flags,
+    char *buf, size_t len);
 
 #ifdef __cplusplus
 }
