@@ -73,8 +73,18 @@ static void crash_handler(int signo, siginfo_t *si, void *ucontext) {
 #endif
     }
   }
-  w_log(W_LOG_FATAL, "Terminating due to signal %d %s. %s (%p)\n",
-      signo, strsignal(signo), reason, si ? si->si_value.sival_ptr : NULL);
+
+  dprintf(STDERR_FILENO, "Terminating due to signal %d %s. %s (%p)\n",
+      signo, sys_siglist[signo], reason, si ? si->si_value.sival_ptr : NULL);
+
+#if defined(HAVE_BACKTRACE) && defined(HAVE_BACKTRACE_SYMBOLS_FD)
+  {
+    void *array[24];
+    size_t size = backtrace(array, sizeof(array)/sizeof(array[0]));
+    backtrace_symbols_fd(array, size, STDERR_FILENO);
+  }
+#endif
+  abort();
 }
 #endif
 
@@ -84,7 +94,7 @@ void w_setup_signal_handlers(void) {
 
   memset(&sa, 0, sizeof(sa));
   sa.sa_sigaction = crash_handler;
-  sa.sa_flags = SA_SIGINFO;
+  sa.sa_flags = SA_SIGINFO|SA_RESETHAND;
 
   sigaction(SIGSEGV, &sa, NULL);
 #ifdef SIGBUS

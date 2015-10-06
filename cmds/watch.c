@@ -26,6 +26,7 @@ bool w_cmd_realpath_root(json_t *args, char **errmsg)
 
   return true;
 }
+W_CAP_REG("clock-sync-timeout")
 
 /* clock /root [options]
  * Returns the current clock value for a watched root
@@ -37,18 +38,17 @@ static void cmd_clock(struct watchman_client *client, json_t *args)
 {
   w_root_t *root;
   json_t *resp;
-  unsigned int sync_timeout = 0;
+  int sync_timeout = 0;
 
   if (json_array_size(args) == 3) {
-    json_t *options = json_array_get(args, 2);
-    if (options) {
-      json_t *st_json = json_object_get(options, "sync_timeout");
-      if (st_json) {
-        sync_timeout = (unsigned int)json_integer_value(st_json);
-      }
+    const char *ignored;
+    if (0 != json_unpack(args, "[s, s, {s?:i*}]",
+                         &ignored, &ignored,
+                         "sync_timeout", &sync_timeout)) {
+      send_error_response(client, "malformated argument list for 'clock'");
+      return;
     }
-  }
-  else if (json_array_size(args) != 2) {
+  } else if (json_array_size(args) != 2) {
     send_error_response(client, "wrong number of arguments to 'clock'");
     return;
   }
@@ -59,9 +59,10 @@ static void cmd_clock(struct watchman_client *client, json_t *args)
     return;
   }
 
-  if (sync_timeout) {
-    w_root_sync_to_now(root, sync_timeout);
-    root->ticks++;
+  if (sync_timeout && !w_root_sync_to_now(root, sync_timeout)) {
+    send_error_response(client, "sync_timeout expired");
+    w_root_delref(root);
+    return;
   }
 
   resp = make_response();

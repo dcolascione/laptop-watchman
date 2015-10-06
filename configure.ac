@@ -1,4 +1,4 @@
-AC_INIT([watchman], [3.8.0], [], [watchman])
+AC_INIT([watchman], [3.9.0], [], [watchman])
 AC_CANONICAL_TARGET
 AM_INIT_AUTOMAKE([dist-bzip2 subdir-objects foreign])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES(yes)])
@@ -95,7 +95,6 @@ AC_ARG_WITH(ruby, [
 ])
 AM_CONDITIONAL(HAVE_RUBY, [test "x$want_ruby" = "xyes"])
 
-pcre_config="yes"
 AC_ARG_WITH(pcre, [
   --without-pcre       Don't enable pcre support.
   --with-pcre=PATH     Enable pcre support.  PATH is location of pcre-config.
@@ -103,17 +102,44 @@ AC_ARG_WITH(pcre, [
                        $PATH
 ],[
   pcre_config="$withval"
+],[
+  pcre_config="check"
 ])
 
 if test "$pcre_config" != "no" ; then
-  if test "$pcre_config" = "yes" ; then
-    pcre_config="pcre-config"
+  if test "$pcre_config" = "yes" -o "$pcre_config" = "check"; then
+    AC_PATH_PROG(PCRE_CONFIG_PATH, pcre-config, false)
+    dnl If --with-pcre was specified but pcre-config not found, fail hard now.
+    if test "$pcre_config" = "yes" -a "$PCRE_CONFIG_PATH" = "false"; then
+      AC_MSG_FAILURE([--with-pcre was given, but pcre-config not found in PATH])
+    fi
+  else
+    PCRE_CONFIG_PATH="$pcre_config"
   fi
 
-  if $pcre_config --version >/dev/null ; then
-    LIBS="$LIBS `$pcre_config --libs`"
-    CFLAGS="$CFLAGS `$pcre_config --cflags`"
-    AC_CHECK_HEADERS(pcre.h)
+  AC_MSG_CHECKING(for PCRE using $PCRE_CONFIG_PATH)
+  pcre_version=`"$PCRE_CONFIG_PATH" --version 2>/dev/null`
+  if test $? -ne 0; then
+    AC_MSG_RESULT(failed)
+  else
+    AC_MSG_RESULT($pcre_version)
+  fi
+
+  if test -n "$pcre_version"; then
+    PCRE_LIBS=`$PCRE_CONFIG_PATH --libs`
+    LIBS="$LIBS $PCRE_LIBS"
+    PCRE_CFLAGS=`$PCRE_CONFIG_PATH --cflags`
+    CFLAGS="$CFLAGS $PCRE_CFLAGS"
+    CPPFLAGS="$CPPFLAGS $PCRE_CFLAGS"
+    AC_CHECK_HEADERS(pcre.h, [], [
+      if test "$pcre_config" != "check"; then
+         AC_MSG_FAILURE([--with-pcre was given, but pcre not found:
+  pcre-config --libs=$PCRE_LIBS
+  pcre-config --cflags=$PCRE_CFLAGS])
+      fi
+    ])
+  elif test "$pcre_config" != "check"; then
+    AC_MSG_FAILURE([$PCRE_CONFIG_PATH failed to run, could not check for PCRE])
   fi
 fi
 
@@ -192,18 +218,18 @@ AC_SEARCH_LIBS([socket], [socket])
 
 AC_CHECK_HEADERS(sys/types.h inttypes.h locale.h port.h sys/inotify.h sys/event.h)
 AC_CHECK_FUNCS(mkostemp kqueue port_create inotify_init strtoll localeconv statfs)
-AC_CHECK_FUNCS(accept4)
+AC_CHECK_FUNCS(accept4 inotify_init1)
 AC_CHECK_HEADERS(sys/vfs.h sys/param.h sys/mount.h sys/statfs.h sys/statvfs.h, [], [],
 [[#ifdef __OpenBSD__
 # include <sys/param.h>
 #endif
 ]])
 AC_CHECK_HEADERS(valgrind/valgrind.h)
-AC_CHECK_HEADERS(execinfo.h)
+AC_CHECK_HEADERS(execinfo.h sys/resource.h)
 AC_CHECK_HEADERS(CoreServices/CoreServices.h, [
   LIBS="$LIBS -framework CoreServices"
 ])
-AC_CHECK_FUNCS(backtrace backtrace_symbols)
+AC_CHECK_FUNCS(backtrace backtrace_symbols backtrace_symbols_fd)
 
 if test -n "$ac_cv_header_sys_statvfs_h"; then
 AC_CHECK_MEMBERS([struct statvfs.f_fstypename,struct statvfs.f_basetype],

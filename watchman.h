@@ -74,6 +74,9 @@ extern "C" {
 #ifdef HAVE_SYS_PARAM_H
 # include <sys/param.h>
 #endif
+#ifdef HAVE_SYS_RESOURCE_H
+# include <sys/resource.h>
+#endif
 #ifndef _WIN32
 // Not explicitly exported on Darwin, so we get to define it.
 extern char **environ;
@@ -301,9 +304,13 @@ struct watchman_ops {
   // What's it called??
   const char *name;
 
-  // true if this watcher notifies for individual files,
-  // false if it only notifies for dirs
-  bool has_per_file_notifications;
+  // if this watcher notifies for individual files contained within
+  // a watched dir, false if it only notifies for dirs
+#define WATCHER_HAS_PER_FILE_NOTIFICATIONS 1
+  // if renames do not reliably report the individual
+  // files renamed in the hierarchy
+#define WATCHER_COALESCED_RENAME 2
+  unsigned flags;
 
   // Perform any global initialization needed for the watcher mechanism
   // and return a context pointer that will be passed to all other ops
@@ -605,6 +612,7 @@ w_string_t *w_string_canon_path(w_string_t *str);
 void w_string_in_place_normalize_separators(w_string_t **str, char target_sep);
 w_string_t *w_string_normalize_separators(w_string_t *str, char target_sep);
 w_string_t *w_string_path_cat(w_string_t *parent, w_string_t *rhs);
+w_string_t *w_string_path_cat_cstr(w_string_t *parent, const char *rhs);
 bool w_string_startswith(w_string_t *str, w_string_t *prefix);
 bool w_string_startswith_caseless(w_string_t *str, w_string_t *prefix);
 w_string_t *w_string_shell_escape(const w_string_t *str);

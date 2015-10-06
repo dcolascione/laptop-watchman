@@ -88,9 +88,52 @@ static void run_service(void)
   exit(1);
 }
 
+#ifndef _WIN32
+// close any random descriptors that we may have inherited,
+// leaving only the main stdio descriptors open, if we execute a
+// child process.
+static void close_random_fds(void) {
+  struct rlimit limit;
+  long open_max = 0;
+  int max_fd;
+
+  // Deduce the upper bound for number of descriptors
+  limit.rlim_cur = 0;
+#ifdef RLIMIT_NOFILE
+  if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+    limit.rlim_cur = 0;
+  }
+#elif defined(RLIM_OFILE)
+  if (getrlimit(RLIMIT_OFILE, &limit) != 0) {
+    limit.rlim_cur = 0;
+  }
+#endif
+#ifdef _SC_OPEN_MAX
+  open_max = sysconf(_SC_OPEN_MAX);
+#endif
+  if (open_max <= 0) {
+    open_max = 36; /* POSIX_OPEN_MAX (20) + some padding */
+  }
+  if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > INT_MAX) {
+    // "no limit", which seems unlikely
+    limit.rlim_cur = INT_MAX;
+  }
+  // Take the larger of the two values we compute
+  if (limit.rlim_cur > (rlim_t)open_max) {
+    open_max = limit.rlim_cur;
+  }
+
+  for (max_fd = open_max; max_fd > STDERR_FILENO; --max_fd) {
+    close(max_fd);
+  }
+}
+#endif
+
 #if !defined(USE_GIMLI) && !defined(_WIN32)
 static void daemonize(void)
 {
+  close_random_fds();
+
   // the double-fork-and-setsid trick establishes a
   // child process that runs in its own process group
   // with its own session and that won't get killed
@@ -188,6 +231,8 @@ static void spawn_via_gimli(void)
     append_argv(argv, daemon_argv[i]);
   }
 
+  close_random_fds();
+
   posix_spawnattr_init(&attr);
   posix_spawn_file_actions_init(&actions);
   posix_spawn_file_actions_addopen(&actions,
@@ -218,6 +263,8 @@ static void spawn_via_launchd(void)
   posix_spawnattr_t attr;
   pid_t pid;
   int res;
+
+  close_random_fds();
 
   if (_NSGetExecutablePath(watchman_path, &size) == -1) {
     w_log(W_LOG_ERR, "_NSGetExecutablePath: path too long; size %u\n", size);
@@ -831,6 +878,26 @@ int main(int argc, char **argv)
   if (!no_spawn) {
     w_log(W_LOG_ERR, "unable to talk to your watchman on %s! (%s)\n",
         sock_name, strerror(errno));
+#ifdef __APPLE__
+    if (getenv("TMUX")) {
+      w_log(W_LOG_ERR, "\n"
+"You may be hitting a tmux related session issue.\n"
+"An immediate workaround is to run:\n"
+"\n"
+"    watchman version\n"
+"\n"
+"just once, from *outside* your tmux session, to allow the launchd\n"
+"registration to be setup.  Once done, you can continue to access\n"
+"watchman from inside your tmux sessions as usual.\n"
+"\n"
+"Longer term, you may wish to install this tool:\n"
+"\n"
+"    https://github.com/ChrisJohnsen/tmux-MacOSX-pasteboard\n"
+"\n"
+"and configure tmux to use `reattach-to-user-namespace`\n"
+"when it launches your shell.\n");
+    }
+#endif
   }
   return 1;
 }

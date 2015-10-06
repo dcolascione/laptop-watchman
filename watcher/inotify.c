@@ -124,7 +124,11 @@ bool inot_root_init(watchman_global_watcher_t watcher, w_root_t *root,
   root->watch = state;
   pthread_mutex_init(&state->lock, NULL);
 
+#ifdef HAVE_INOTIFY_INIT1
+  state->infd = inotify_init1(IN_CLOEXEC);
+#else
   state->infd = inotify_init();
+#endif
   if (state->infd == -1) {
     ignore_result(asprintf(errmsg, "watch(%.*s): inotify_init error: %s",
         root->root_path->len, root->root_path->buf, inot_strerror(errno)));
@@ -281,7 +285,8 @@ static void process_inotify_event(
       }
     }
 
-    if (ine->len > 0 && (ine->mask & IN_MOVED_FROM)) {
+    if (ine->len > 0 && (ine->mask & (IN_MOVED_FROM|IN_ISDIR))
+        == (IN_MOVED_FROM|IN_ISDIR)) {
       struct pending_move mv;
 
       // record this as a pending move, so that we can automatically
@@ -302,13 +307,15 @@ static void process_inotify_event(
           name->buf);
     }
 
-    if (ine->len > 0 && (ine->mask & IN_MOVED_TO)) {
+    if (ine->len > 0 && (ine->mask & (IN_MOVED_TO|IN_ISDIR))
+        == (IN_MOVED_FROM|IN_ISDIR)) {
       struct pending_move *old;
 
       pthread_mutex_lock(&state->lock);
       old = w_ht_val_ptr(w_ht_get(state->move_map, ine->cookie));
       if (old) {
-        int wd = inotify_add_watch(state->infd, name->buf, WATCHMAN_INOTIFY_MASK);
+        int wd = inotify_add_watch(state->infd, name->buf,
+                    WATCHMAN_INOTIFY_MASK);
         if (wd == -1) {
           if (errno == ENOSPC || errno == ENOMEM) {
             // Limits exceeded, no recovery from our perspective
@@ -461,7 +468,7 @@ static void inot_file_free(watchman_global_watcher_t watcher,
 
 struct watchman_ops inotify_watcher = {
   "inotify",
-  true, // per_file_notifications
+  WATCHER_HAS_PER_FILE_NOTIFICATIONS,
   inot_global_init,
   inot_global_dtor,
   inot_root_init,

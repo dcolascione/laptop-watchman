@@ -427,7 +427,8 @@ bool w_root_sync_to_now(w_root_t *root, int timeoutms)
   while (!cookie.seen) {
     errcode = pthread_cond_timedwait(&cookie.cond, &root->lock, &deadline);
     if (errcode && !cookie.seen) {
-      w_log(W_LOG_ERR, "sync_to_now: %s timedwait failed: %d: istimeout=%d %s\n",
+      w_log(W_LOG_ERR,
+          "sync_to_now: %s timedwait failed: %d: istimeout=%d %s\n",
           path_str->buf, errcode, errcode == ETIMEDOUT, strerror(errcode));
       goto out;
     }
@@ -999,12 +1000,15 @@ static void stat_path(w_root_t *root,
           // called for the root itself)
           w_string_equal(full_path, root->query_cookie_dir)) {
 
-        if (!watcher_ops->has_per_file_notifications) {
+        if (!watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
           /* we always need to crawl, but may not need to be fully recursive */
           crawler(root, coll, full_path, now, recursive);
         } else {
           /* we get told about changes on the child, so we only
-           * need to crawl if we've never seen the dir before */
+           * need to crawl if we've never seen the dir before.
+           * An exception is that fsevents will only report the root
+           * of a dir rename and not a rename event for all of its
+           * children. */
           if (recursive) {
             crawler(root, coll, full_path, now, recursive);
           }
@@ -1015,7 +1019,8 @@ static void stat_path(w_root_t *root,
       // our former tree here
       w_root_mark_deleted(root, dir_ent, now, true);
     }
-    if (watcher_ops->has_per_file_notifications && !S_ISDIR(st.st_mode) &&
+    if ((watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) &&
+        !S_ISDIR(st.st_mode) &&
         !w_string_equal(dir_name, root->root_path)) {
       /* Make sure we update the mtime on the parent directory. */
       stat_path(root, coll, dir_name, now, false, via_notify);
@@ -1052,7 +1057,8 @@ void w_root_process_path(w_root_t *root,
    */
   if (w_string_startswith(full_path, root->query_cookie_prefix)) {
     struct watchman_query_cookie *cookie;
-    bool consider_cookie = watcher_ops->has_per_file_notifications ?
+    bool consider_cookie =
+      (watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) ?
       (via_notify || !root->done_initial) : true;
 
     if (!consider_cookie) {
@@ -1226,6 +1232,17 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
   struct dirent *dirent;
   w_ht_iter_t i;
   char path[WATCHMAN_NAME_MAX];
+  bool stat_all = false;
+
+  if (watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
+    stat_all = watcher_ops->flags & WATCHER_COALESCED_RENAME;
+  } else {
+    // If the watcher doesn't give us per-file notifications for
+    // watched dirs, then we'll end up explicitly tracking them
+    // and will get updates for the files explicitly.
+    // We don't need to look at the files again when we crawl
+    stat_all = false;
+  }
 
   dir = w_root_resolve_dir(root, dir_name, true);
 
@@ -1272,7 +1289,7 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
     if (file) {
       file->maybe_deleted = false;
     }
-    if (!file || !file->exists) {
+    if (!file || !file->exists || stat_all || recursive) {
       w_pending_coll_add_rel(coll, dir, dirent->d_name,
           true, now, false);
     }
@@ -2219,7 +2236,7 @@ bool w_is_path_absolute(const char *path) {
 static w_root_t *root_resolve(const char *filename, bool auto_watch,
     bool *created, char **errmsg)
 {
-  struct watchman_root *root = NULL;
+  struct watchman_root *root = NULL, *existing = NULL;
   w_ht_val_t root_val;
   char *watch_path;
   w_string_t *root_str;
@@ -2319,11 +2336,20 @@ static w_root_t *root_resolve(const char *filename, bool auto_watch,
     return NULL;
   }
 
-  *created = true;
-
   pthread_mutex_lock(&root_lock);
-  // adds 1 ref
-  w_ht_set(watched_roots, w_ht_ptr_val(root->root_path), w_ht_ptr_val(root));
+  existing = w_ht_val_ptr(w_ht_get(watched_roots,
+                w_ht_ptr_val(root->root_path)));
+  if (existing) {
+    // Someone beat us in this race
+    w_root_addref(existing);
+    w_root_delref(root);
+    root = existing;
+    *created = false;
+  } else {
+    // adds 1 ref
+    w_ht_set(watched_roots, w_ht_ptr_val(root->root_path), w_ht_ptr_val(root));
+    *created = true;
+  }
   pthread_mutex_unlock(&root_lock);
 
   // caller owns 1 ref
