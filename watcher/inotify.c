@@ -195,18 +195,28 @@ static void inot_root_stop_watch_file(watchman_global_watcher_t watcher,
   unused_parameter(file);
 }
 
-static DIR *inot_root_start_watch_dir(watchman_global_watcher_t watcher,
+static struct watchman_dir_handle *inot_root_start_watch_dir(
+    watchman_global_watcher_t watcher,
     w_root_t *root, struct watchman_dir *dir, struct timeval now,
     const char *path) {
   struct inot_root_state *state = root->watch;
-  DIR *osdir = NULL;
-  int newwd;
+  struct watchman_dir_handle *osdir = NULL;
+  int newwd, err;
   unused_parameter(watcher);
+
+  // Carry out our very strict opendir first to ensure that we're not
+  // traversing symlinks in the context of this root
+  osdir = w_dir_open(path);
+  if (!osdir) {
+    handle_open_errno(root, dir, now, "opendir", errno, NULL);
+    return NULL;
+  }
 
   // The directory might be different since the last time we looked at it, so
   // call inotify_add_watch unconditionally.
   newwd = inotify_add_watch(state->infd, path, WATCHMAN_INOTIFY_MASK);
   if (newwd == -1) {
+    err = errno;
     if (errno == ENOSPC || errno == ENOMEM) {
       // Limits exceeded, no recovery from our perspective
       set_poison_state(root, dir->path, now, "inotify-add-watch", errno,
@@ -215,6 +225,8 @@ static DIR *inot_root_start_watch_dir(watchman_global_watcher_t watcher,
       handle_open_errno(root, dir, now, "inotify_add_watch", errno,
           inot_strerror(errno));
     }
+    w_dir_close(osdir);
+    errno = err;
     return NULL;
   }
 
@@ -223,12 +235,6 @@ static DIR *inot_root_start_watch_dir(watchman_global_watcher_t watcher,
   w_ht_replace(state->wd_to_name, newwd, w_ht_ptr_val(dir->path));
   pthread_mutex_unlock(&state->lock);
   w_log(W_LOG_DBG, "adding %d -> %s mapping\n", newwd, path);
-
-  osdir = opendir_nofollow(path);
-  if (!osdir) {
-    handle_open_errno(root, dir, now, "opendir", errno, NULL);
-    return NULL;
-  }
 
   return osdir;
 }
@@ -360,7 +366,8 @@ static void process_inotify_event(
 
       w_log(W_LOG_DBG, "add_pending for inotify mask=%x %.*s\n",
           ine->mask, name->len, name->buf);
-      w_pending_coll_add(coll, name, true, now, true);
+      w_pending_coll_add(coll, name, now,
+          W_PENDING_RECURSIVE|W_PENDING_VIA_NOTIFY);
 
       w_string_delref(name);
 

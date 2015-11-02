@@ -38,6 +38,7 @@ SRCS=\
 	spawn.c \
 	opt.c \
 	cfg.c \
+	checksock.c \
 	fstype.c     \
 	log.c        \
 	json.c       \
@@ -45,6 +46,7 @@ SRCS=\
 	expflags.c   \
 	hash.c       \
 	ioprio.c     \
+	opendir.c    \
 	pending.c    \
 	stream.c     \
 	stream_win.c \
