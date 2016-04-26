@@ -38,6 +38,15 @@ static bool subscription_generator(
   return true;
 }
 
+static void update_subscription_ticks(struct watchman_client_subscription *sub,
+    w_query_res *res) {
+  // create a new spec that will be used the next time
+  if (sub->query->since_spec) {
+    w_clockspec_free(sub->query->since_spec);
+  }
+  sub->query->since_spec = w_clockspec_new_clock(res->root_number, res->ticks);
+}
+
 static json_t *build_subscription_results(
     struct watchman_client_subscription *sub,
     w_root_t *root)
@@ -59,6 +68,11 @@ static json_t *build_subscription_results(
   // Subscriptions never need to sync explicitly; we are only dispatched
   // at settle points which are by definition sync'd to the present time
   sub->query->sync_timeout = 0;
+  // We're called by the io thread, so there's little chance that the root
+  // could be legitimately blocked by something else.  That means that we
+  // can use a short lock_timeout
+  sub->query->lock_timeout =
+      (uint32_t)cfg_get_int(root, "subscription_lock_timeout_ms", 100);
   if (!w_query_execute(sub->query, root, &res, subscription_generator, sub)) {
     w_log(W_LOG_ERR, "error running subscription %s query: %s",
         sub->name->buf, res.errmsg);
@@ -70,6 +84,7 @@ static json_t *build_subscription_results(
       sub->name->buf, res.num_results);
 
   if (res.num_results == 0) {
+    update_subscription_ticks(sub, &res);
     w_query_result_free(&res);
     return NULL;
   }
@@ -91,12 +106,7 @@ static json_t *build_subscription_results(
   if (clock_id_string(res.root_number, res.ticks, clockbuf, sizeof(clockbuf))) {
     set_prop(response, "clock", json_string_nocheck(clockbuf));
   }
-  // create a new spec that will be used the next time
-  if (since_spec) {
-    w_clockspec_free(since_spec);
-    since_spec = NULL;
-  }
-  sub->query->since_spec = w_clockspec_new_clock(res.root_number, res.ticks);
+  update_subscription_ticks(sub, &res);
 
   set_prop(response, "is_fresh_instance", json_boolean(res.is_fresh_instance));
   set_prop(response, "files", file_list);
@@ -108,7 +118,7 @@ static json_t *build_subscription_results(
 
 /* must be called with root and client locked */
 void w_run_subscription_rules(
-    struct watchman_client *client,
+    struct watchman_user_client *client,
     struct watchman_client_subscription *sub,
     w_root_t *root)
 {
@@ -120,30 +130,70 @@ void w_run_subscription_rules(
 
   add_root_warnings_to_response(response, root);
 
-  if (!enqueue_response(client, response, true)) {
+  if (!enqueue_response(&client->client, response, true)) {
     w_log(W_LOG_DBG, "failed to queue sub response\n");
     json_decref(response);
   }
 }
 
+void w_cancel_subscriptions_for_root(w_root_t *root) {
+  w_ht_iter_t iter;
+  pthread_mutex_lock(&w_client_lock);
+  if (w_ht_first(clients, &iter)) {
+    do {
+      struct watchman_user_client *client = w_ht_val_ptr(iter.value);
+      w_ht_iter_t citer;
+
+      if (w_ht_first(client->subscriptions, &citer)) {
+        do {
+          struct watchman_client_subscription *sub = w_ht_val_ptr(citer.value);
+
+          if (sub->root == root) {
+            json_t *response = make_response();
+
+            w_log(W_LOG_ERR,
+                  "Cancel subscription %.*s for client:stm=%p due to "
+                  "root cancellation\n",
+                  sub->name->len, sub->name->buf, client->client.stm);
+
+            set_prop(response, "root", w_string_to_json(root->root_path));
+            set_prop(response, "subscription", w_string_to_json(sub->name));
+            set_prop(response, "canceled", json_true());
+
+            if (!enqueue_response(&client->client, response, true)) {
+              w_log(W_LOG_DBG, "failed to queue sub cancellation\n");
+              json_decref(response);
+            }
+
+            w_ht_iter_del(client->subscriptions, &citer);
+          }
+        } while (w_ht_next(client->subscriptions, &citer));
+      }
+    } while (w_ht_next(clients, &iter));
+  }
+  pthread_mutex_unlock(&w_client_lock);
+}
+
 /* unsubscribe /root subname
  * Cancels a subscription */
-static void cmd_unsubscribe(struct watchman_client *client, json_t *args)
+static void cmd_unsubscribe(struct watchman_client *clientbase, json_t *args)
 {
   w_root_t *root;
   const char *name;
   w_string_t *sname;
   bool deleted;
   json_t *resp;
+  struct watchman_user_client *client =
+      (struct watchman_user_client *)clientbase;
 
-  root = resolve_root_or_err(client, args, 1, false);
+  root = resolve_root_or_err(&client->client, args, 1, false);
   if (!root) {
     return;
   }
 
   name = json_string_value(json_array_get(args, 2));
   if (!name) {
-    send_error_response(client,
+    send_error_response(&client->client,
         "expected 2nd parameter to be subscription name");
     w_root_delref(root);
     return;
@@ -161,14 +211,15 @@ static void cmd_unsubscribe(struct watchman_client *client, json_t *args)
   set_prop(resp, "unsubscribe", json_string_nocheck(name));
   set_prop(resp, "deleted", json_boolean(deleted));
 
-  send_and_dispose_response(client, resp);
+  send_and_dispose_response(&client->client, resp);
   w_root_delref(root);
 }
-W_CMD_REG("unsubscribe", cmd_unsubscribe, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("unsubscribe", cmd_unsubscribe, CMD_DAEMON | CMD_ALLOW_ANY_USER,
+          w_cmd_realpath_root)
 
 /* subscribe /root subname {query}
  * Subscribes the client connection to the specified root. */
-static void cmd_subscribe(struct watchman_client *client, json_t *args)
+static void cmd_subscribe(struct watchman_client *clientbase, json_t *args)
 {
   w_root_t *root;
   struct watchman_client_subscription *sub;
@@ -180,20 +231,25 @@ static void cmd_subscribe(struct watchman_client *client, json_t *args)
   struct w_query_field_list field_list;
   char *errmsg;
   int defer = true; /* can't use bool because json_unpack requires int */
+  json_t *defer_list = NULL;
+  json_t *drop_list = NULL;
+  struct watchman_user_client *client =
+      (struct watchman_user_client *)clientbase;
 
   if (json_array_size(args) != 4) {
-    send_error_response(client, "wrong number of arguments for subscribe");
+    send_error_response(&client->client,
+                        "wrong number of arguments for subscribe");
     return;
   }
 
-  root = resolve_root_or_err(client, args, 1, true);
+  root = resolve_root_or_err(&client->client, args, 1, true);
   if (!root) {
     return;
   }
 
   name = json_string_value(json_array_get(args, 2));
   if (!name) {
-    send_error_response(client,
+    send_error_response(&client->client,
         "expected 2nd parameter to be subscription name");
     goto done;
   }
@@ -202,21 +258,34 @@ static void cmd_subscribe(struct watchman_client *client, json_t *args)
 
   jfield_list = json_object_get(query_spec, "fields");
   if (!parse_field_list(jfield_list, &field_list, &errmsg)) {
-    send_error_response(client, "invalid field list: %s", errmsg);
+    send_error_response(&client->client, "invalid field list: %s", errmsg);
     free(errmsg);
     goto done;
   }
 
   query = w_query_parse(root, query_spec, &errmsg);
   if (!query) {
-    send_error_response(client, "failed to parse query: %s", errmsg);
+    send_error_response(&client->client, "failed to parse query: %s", errmsg);
     free(errmsg);
+    goto done;
+  }
+
+  json_unpack(query_spec, "{s?:o}", "defer", &defer_list);
+  if (defer_list && !json_is_array(defer_list)) {
+    send_error_response(&client->client,
+                        "defer field must be an array of strings");
+    goto done;
+  }
+  json_unpack(query_spec, "{s?:o}", "drop", &drop_list);
+  if (drop_list && !json_is_array(drop_list)) {
+    send_error_response(&client->client,
+                        "drop field must be an array of strings");
     goto done;
   }
 
   sub = calloc(1, sizeof(*sub));
   if (!sub) {
-    send_error_response(client, "no memory!");
+    send_error_response(&client->client, "no memory!");
     goto done;
   }
 
@@ -225,6 +294,26 @@ static void cmd_subscribe(struct watchman_client *client, json_t *args)
 
   json_unpack(query_spec, "{s?:b}", "defer_vcs", &defer);
   sub->vcs_defer = defer;
+
+  if (drop_list || defer_list) {
+    size_t i;
+
+    sub->drop_or_defer = w_ht_new(2, &w_ht_string_funcs);
+    if (defer_list) {
+      for (i = 0; i < json_array_size(defer_list); i++) {
+        w_ht_replace(sub->drop_or_defer,
+            w_ht_ptr_val(w_string_new(json_string_value(
+                  json_array_get(defer_list, i)))), false);
+      }
+    }
+    if (drop_list) {
+      for (i = 0; i < json_array_size(drop_list); i++) {
+        w_ht_replace(sub->drop_or_defer,
+            w_ht_ptr_val(w_string_new(json_string_value(
+                  json_array_get(drop_list, i)))), true);
+      }
+    }
+  }
 
   memcpy(&sub->field_list, &field_list, sizeof(field_list));
   sub->root = root;
@@ -238,16 +327,17 @@ static void cmd_subscribe(struct watchman_client *client, json_t *args)
   annotate_with_clock(root, resp);
   set_prop(resp, "subscribe", json_string(name));
   add_root_warnings_to_response(resp, root);
-  send_and_dispose_response(client, resp);
+  send_and_dispose_response(&client->client, resp);
 
   resp = build_subscription_results(sub, root);
   if (resp) {
-    send_and_dispose_response(client, resp);
+    send_and_dispose_response(&client->client, resp);
   }
 done:
   w_root_delref(root);
 }
-W_CMD_REG("subscribe", cmd_subscribe, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("subscribe", cmd_subscribe, CMD_DAEMON | CMD_ALLOW_ANY_USER,
+          w_cmd_realpath_root)
 
 /* vim:ts=2:sw=2:et:
  */

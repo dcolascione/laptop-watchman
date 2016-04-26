@@ -5,6 +5,11 @@
 
 static w_ht_t *command_funcs = NULL;
 static w_ht_t *capabilities = NULL;
+/* Some error conditions will put us into a non-recoverable state where we
+ * can't guarantee that we will be operating correctly.  Rather than suffering
+ * in silence and misleading our clients, we'll poison ourselves and advertise
+ * that we have done so and provide some advice on how the user can cure us. */
+char *poisoned_reason = NULL;
 
 static int compare_def(const void *A, const void *B)
 {
@@ -135,22 +140,56 @@ bool dispatch_command(struct watchman_client *client, json_t *args, int mode)
 {
   struct watchman_command_handler_def *def;
   char *errmsg = NULL;
+  bool result = false;
+  char sample_name[128];
+
+  // Stash a reference to the current command to make it easier to log
+  // the command context in some of the error paths
+  client->current_command = args;
+  json_incref(client->current_command);
 
   def = lookup(args, &errmsg, mode);
 
   if (!def) {
     send_error_response(client, "%s", errmsg);
-    free(errmsg);
-    return false;
+    goto done;
   }
 
   if (poisoned_reason && (def->flags & CMD_POISON_IMMUNE) == 0) {
     send_error_response(client, "%s", poisoned_reason);
+    goto done;
+  }
+
+  if (!client->client_is_owner && (def->flags & CMD_ALLOW_ANY_USER) == 0) {
+    send_error_response(client, "you must be the process owner to execute '%s'",
+                        def->name);
     return false;
   }
 
+  w_log(W_LOG_DBG, "dispatch_command: %s\n", def->name);
+  snprintf(sample_name, sizeof(sample_name), "dispatch_command:%s", def->name);
+  w_perf_start(&client->perf_sample, sample_name);
+  w_perf_set_wall_time_thresh(
+      &client->perf_sample,
+      cfg_get_double(NULL, "slow_command_log_threshold_seconds", 1.0));
+
+  result = true;
   def->func(client, args);
-  return true;
+
+  if (w_perf_finish(&client->perf_sample)) {
+    json_incref(args);
+    w_perf_add_meta(&client->perf_sample, "args", args);
+    w_perf_log(&client->perf_sample);
+  } else {
+    w_log(W_LOG_DBG, "dispatch_command: %s (completed)\n", def->name);
+  }
+
+done:
+  free(errmsg);
+  json_decref(client->current_command);
+  client->current_command = NULL;
+  w_perf_destroy(&client->perf_sample);
+  return result;
 }
 
 void w_capability_register(const char *name) {

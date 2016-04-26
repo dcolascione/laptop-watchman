@@ -6,8 +6,6 @@
 # include <sys/attr.h>
 #endif
 
-static struct watchman_ops *watcher_ops = NULL;
-static watchman_global_watcher_t watcher = NULL;
 static w_ht_t *watched_roots = NULL;
 static volatile long live_roots = 0;
 static pthread_mutex_t root_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -15,12 +13,6 @@ static pthread_mutex_t root_lock = PTHREAD_MUTEX_INITIALIZER;
 // Each root gets a number that uniquely identifies it within the process. This
 // helps avoid confusion if a root is removed and then added again.
 static long next_root_number = 1;
-
-/* Some error conditions will put us into a non-recoverable state where we
- * can't guarantee that we will be operating correctly.  Rather than suffering
- * in silence and misleading our clients, we'll poison ourselves and advertise
- * that we have done so and provide some advice on how the user can cure us. */
-char *poisoned_reason = NULL;
 
 static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
     w_string_t *dir_name, struct timeval now, bool recursive);
@@ -55,10 +47,6 @@ static void delete_dir(w_ht_val_t val)
   if (dir->files) {
     w_ht_free(dir->files);
     dir->files = NULL;
-  }
-  if (dir->lc_files) {
-    w_ht_free(dir->lc_files);
-    dir->lc_files = NULL;
   }
   if (dir->dirs) {
     w_ht_free(dir->dirs);
@@ -131,7 +119,7 @@ static bool w_root_init(w_root_t *root, char **errmsg)
   }
   w_dir_close(osdir);
 
-  if (!watcher_ops->root_init(watcher, root, errmsg)) {
+  if (!w_watcher_init(root, errmsg)) {
     return false;
   }
 
@@ -214,7 +202,8 @@ static bool apply_ignore_vcs_configuration(w_root_t *root, char **errmsg)
     // While we're at it, see if we can find out where to put our
     // query cookie information
     if (root->query_cookie_dir == NULL &&
-        lstat(fullname->buf, &st) == 0 && S_ISDIR(st.st_mode)) {
+        w_lstat(fullname->buf, &st, root->case_sensitive) == 0 &&
+        S_ISDIR(st.st_mode)) {
       // root/{.hg,.git,.svn}
       root->query_cookie_dir = w_string_path_cat(root->root_path, name);
     }
@@ -330,24 +319,68 @@ static w_root_t *w_root_new(const char *path, char **errmsg)
   return root;
 }
 
-void w_root_lock(w_root_t *root)
+void w_root_lock(w_root_t *root, const char *purpose)
 {
   int err;
 
   err = pthread_mutex_lock(&root->lock);
   if (err != 0) {
-    w_log(W_LOG_FATAL, "lock [%.*s]: %s\n",
+    w_log(W_LOG_FATAL, "lock (%s) [%.*s]: %s\n",
+        purpose,
         root->root_path->len,
         root->root_path->buf,
         strerror(err)
     );
   }
+  root->lock_reason = purpose;
+}
+
+bool w_root_lock_with_timeout(w_root_t *root, const char *purpose,
+                              int timeoutms) {
+  struct timespec ts;
+  struct timeval delta, now, target;
+  int err;
+
+  if (timeoutms <= 0) {
+    // Special case an immediate check, because the implementation of
+    // pthread_mutex_timedlock may return immediately if we are already
+    // past-due.
+    err = pthread_mutex_trylock(&root->lock);
+  } else {
+    // Add timeout to current time, convert to absolute timespec
+    gettimeofday(&now, NULL);
+    delta.tv_sec = timeoutms / 1000;
+    delta.tv_usec = (timeoutms - (delta.tv_sec * 1000)) * 1000;
+    w_timeval_add(now, delta, &target);
+    w_timeval_to_timespec(target, &ts);
+
+    err = pthread_mutex_timedlock(&root->lock, &ts);
+  }
+  if (err == ETIMEDOUT || err == EBUSY) {
+    w_log(W_LOG_ERR,
+          "lock (%s) [%.*s] failed after %dms, current lock purpose: %s\n",
+          purpose, root->root_path->len, root->root_path->buf, timeoutms,
+          root->lock_reason);
+    errno = ETIMEDOUT;
+    return false;
+  }
+  if (err != 0) {
+    w_log(W_LOG_FATAL, "lock (%s) [%.*s]: %s\n",
+        purpose,
+        root->root_path->len,
+        root->root_path->buf,
+        strerror(err)
+    );
+  }
+  root->lock_reason = purpose;
+  return true;
 }
 
 void w_root_unlock(w_root_t *root)
 {
   int err;
 
+  root->lock_reason = NULL;
   err = pthread_mutex_unlock(&root->lock);
   if (err != 0) {
     w_log(W_LOG_FATAL, "lock: [%.*s] %s\n",
@@ -356,17 +389,6 @@ void w_root_unlock(w_root_t *root)
         strerror(err)
     );
   }
-}
-
-void w_timeoutms_to_abs_timespec(int timeoutms, struct timespec *deadline) {
-  struct timeval now, delta, target;
-
-  /* compute deadline */
-  gettimeofday(&now, NULL);
-  delta.tv_sec = timeoutms / 1000;
-  delta.tv_usec = (timeoutms - (delta.tv_sec * 1000)) * 1000;
-  w_timeval_add(now, delta, &target);
-  w_timeval_to_timespec(target, deadline);
 }
 
 /* Ensure that we're synchronized with the state of the
@@ -388,6 +410,9 @@ bool w_root_sync_to_now(w_root_t *root, int timeoutms)
   w_stm_t file;
   int errcode = 0;
   struct timespec deadline;
+  w_perf_t sample;
+
+  w_perf_start(&sample, "sync_to_now");
 
   if (pthread_cond_init(&cookie.cond, NULL)) {
     errcode = errno;
@@ -398,7 +423,7 @@ bool w_root_sync_to_now(w_root_t *root, int timeoutms)
   cookie.seen = false;
 
   /* generate a cookie name: cookie prefix + id */
-  w_root_lock(root);
+  w_root_lock(root, "w_root_sync_to_now");
   tick = root->ticks++;
   path_str = w_string_make_printf("%.*s%" PRIu32 "-%" PRIu32,
                                   root->query_cookie_prefix->len,
@@ -442,8 +467,26 @@ out:
   w_ht_del(root->query_cookies, w_ht_ptr_val(path_str));
   w_root_unlock(root);
 
+  // We want to know about all timeouts
+  if (!cookie.seen) {
+    w_perf_force_log(&sample);
+  }
+
+  if (w_perf_finish(&sample)) {
+    w_perf_add_root_meta(&sample, root);
+    w_perf_add_meta(&sample, "sync_to_now",
+                    json_pack("{s:b, s:i, s:i}",      //
+                              "success", cookie.seen, //
+                              "timeoutms", timeoutms, //
+                              "errcode", errcode      //
+                              ));
+    w_perf_log(&sample);
+  }
+
   w_string_delref(path_str);
   pthread_cond_destroy(&cookie.cond);
+
+  w_perf_destroy(&sample);
 
   if (!cookie.seen) {
     errno = errcode;
@@ -522,15 +565,12 @@ struct watchman_dir *w_root_resolve_dir(w_root_t *root,
   return dir;
 }
 
-static void apply_dir_size_hint(w_root_t *root, struct watchman_dir *dir,
+static void apply_dir_size_hint(struct watchman_dir *dir,
     uint32_t ndirs, uint32_t nfiles) {
+
   if (nfiles > 0) {
     if (!dir->files) {
       dir->files = w_ht_new(nfiles, &w_ht_string_funcs);
-    }
-    // Only need lc_files if we're case insensitive
-    if (!root->case_sensitive && !dir->lc_files) {
-      dir->lc_files = w_ht_new(nfiles, &w_ht_string_funcs);
     }
   }
   if (!dir->dirs && ndirs > 0) {
@@ -540,12 +580,12 @@ static void apply_dir_size_hint(w_root_t *root, struct watchman_dir *dir,
 
 static void watch_file(w_root_t *root, struct watchman_file *file)
 {
-  watcher_ops->root_start_watch_file(watcher, root, file);
+  root->watcher_ops->root_start_watch_file(root, file);
 }
 
 static void stop_watching_file(w_root_t *root, struct watchman_file *file)
 {
-  watcher_ops->root_stop_watch_file(watcher, root, file);
+  root->watcher_ops->root_stop_watch_file(root, file);
 }
 
 static void remove_from_file_list(w_root_t *root, struct watchman_file *file)
@@ -672,7 +712,7 @@ void stop_watching_dir(w_root_t *root, struct watchman_dir *dir)
     stop_watching_dir(root, child);
   } while (w_ht_next(dir->dirs, &i));
 
-  watcher_ops->root_stop_watch_dir(watcher, root, dir);
+  root->watcher_ops->root_stop_watch_dir(root, dir);
 }
 
 static bool did_file_change(struct watchman_stat *saved,
@@ -725,68 +765,6 @@ static bool did_file_change(struct watchman_stat *saved,
 #define ENOFOLLOWSYMLINK ELOOP
 #endif
 
-// Returns just the canonical basename of a file
-static w_string_t *w_resolve_filesystem_canonical_name(const char *path)
-{
-#ifdef __APPLE__
-  struct attrlist attrlist;
-  struct {
-    uint32_t len;
-    attrreference_t ref;
-    char canonical_name[WATCHMAN_NAME_MAX];
-  } vomit;
-  char *name;
-
-  memset(&attrlist, 0, sizeof(attrlist));
-  attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
-  attrlist.commonattr = ATTR_CMN_NAME;
-
-  if (getattrlist(path, &attrlist, &vomit,
-        sizeof(vomit), FSOPT_NOFOLLOW) == -1) {
-    // signal to caller that the file has disappeared -- the caller will read
-    // errno and do error handling
-    return NULL;
-  }
-
-  name = ((char*)&vomit.ref) + vomit.ref.attr_dataoffset;
-  return w_string_new(name);
-#elif defined(_WIN32)
-  WCHAR long_buf[WATCHMAN_NAME_MAX];
-  WCHAR *base;
-  WCHAR *wpath = w_utf8_to_win_unc(path, -1);
-  DWORD err;
-
-  DWORD long_len = GetLongPathNameW(wpath, long_buf,
-                      sizeof(long_buf)/sizeof(long_buf[0]));
-  err = GetLastError();
-  free(wpath);
-
-  if (long_len == 0 && err == ERROR_FILE_NOT_FOUND) {
-    // signal to caller that the file has disappeared -- the caller will read
-    // errno and do error handling
-    errno = map_win32_err(err);
-    return NULL;
-  }
-
-  if (long_len == 0) {
-    w_log(W_LOG_ERR, "Failed to canon(%s): %s\n", path, win32_strerror(err));
-    return w_string_new_basename(path);
-  }
-
-  if (long_len > sizeof(long_buf)-1) {
-    w_log(W_LOG_FATAL, "GetLongPathNameW needs %lu chars\n", long_len);
-  }
-  long_buf[long_len] = 0;
-  base = long_buf + long_len - 1;
-  while (base > long_buf && base[-1] != WATCHMAN_DIR_SEP) {
-    base--;
-  }
-  return w_string_new_wchar(base, -1);
-#else
-  return w_string_new_basename(path);
-#endif
-}
-
 static void struct_stat_to_watchman_stat(const struct stat *st,
     struct watchman_stat *target) {
   target->size = (off_t)st->st_size;
@@ -806,7 +784,8 @@ static void struct_stat_to_watchman_stat(const struct stat *st,
 
 static void stat_path(w_root_t *root,
     struct watchman_pending_collection *coll, w_string_t *full_path,
-    struct timeval now, bool recursive, bool via_notify,
+    struct timeval now,
+    int flags,
     struct watchman_dir_ent *pre_stat)
 {
   struct watchman_stat st;
@@ -817,6 +796,8 @@ static void stat_path(w_root_t *root,
   struct watchman_file *file = NULL;
   w_string_t *dir_name;
   w_string_t *file_name;
+  bool recursive = flags & W_PENDING_RECURSIVE;
+  bool via_notify = flags & W_PENDING_VIA_NOTIFY;
 
   if (w_ht_get(root->ignore_dirs, w_ht_ptr_val(full_path))) {
     w_log(W_LOG_DBG, "%.*s matches ignore_dir rules\n",
@@ -850,9 +831,10 @@ static void stat_path(w_root_t *root,
     err = 0;
   } else {
     struct stat struct_stat;
-    res = lstat(path, &struct_stat);
+    res = w_lstat(path, &struct_stat, root->case_sensitive);
     err = res == 0 ? 0 : errno;
-    w_log(W_LOG_DBG, "lstat(%s) file=%p dir=%p\n", path, file, dir_ent);
+    w_log(W_LOG_DBG, "w_lstat(%s) file=%p dir=%p res=%d %s\n",
+        path, file, dir_ent, res, strerror(err));
     if (err == 0) {
       struct_stat_to_watchman_stat(&struct_stat, &st);
     } else {
@@ -865,157 +847,46 @@ static void stat_path(w_root_t *root,
     /* it's not there, update our state */
     if (dir_ent) {
       w_root_mark_deleted(root, dir_ent, now, true);
-      w_log(W_LOG_DBG, "lstat(%s) -> %s so stopping watch on %s\n",
-          path, strerror(err), dir_ent->path->buf);
+      w_log(W_LOG_DBG, "w_lstat(%s) -> %s so stopping watch on %.*s\n", path,
+            strerror(err), dir_ent->path->len, dir_ent->path->buf);
       stop_watching_dir(root, dir_ent);
     }
     if (file) {
-      w_log(W_LOG_DBG, "lstat(%s) -> %s so marking %.*s deleted\n",
-          path, strerror(err), file->name->len, file->name->buf);
+      if (file->exists) {
+        w_log(W_LOG_DBG, "w_lstat(%s) -> %s so marking %.*s deleted\n",
+            path, strerror(err), file->name->len, file->name->buf);
+        file->exists = false;
+        w_root_mark_file_changed(root, file, now);
+      }
     } else {
       // It was created and removed before we could ever observe it
       // in the filesystem.  We need to generate a deleted file
       // representation of it now, so that subscription clients can
       // be notified of this event
       file = w_root_resolve_file(root, dir, file_name, now);
-      w_log(W_LOG_DBG, "lstat(%s) -> %s and file node was NULL. "
+      w_log(W_LOG_DBG, "w_lstat(%s) -> %s and file node was NULL. "
           "Generating a deleted node.\n", path, strerror(err));
+      file->exists = false;
+      w_root_mark_file_changed(root, file, now);
     }
-    file->exists = false;
-    w_root_mark_file_changed(root, file, now);
+
+    if (!root->case_sensitive &&
+        !w_string_equal(dir_name, root->root_path)) {
+      /* If we rejected the name because it wasn't canonical,
+       * we need to ensure that we look in the parent dir to discover
+       * the new item(s) */
+      w_log(W_LOG_DBG, "we're case insensitive, and %s is ENOENT, "
+                       "speculatively look at parent dir %.*s\n",
+            path, dir_name->len, dir_name->buf);
+      stat_path(root, coll, dir_name, now, 0, NULL);
+    }
+
   } else if (res) {
-    w_log(W_LOG_ERR, "lstat(%s) %d %s\n",
+    w_log(W_LOG_ERR, "w_lstat(%s) %d %s\n",
         path, err, strerror(err));
   } else {
     if (!file) {
       file = w_root_resolve_file(root, dir, file_name, now);
-    }
-
-    if (!root->case_sensitive) {
-      // Determine canonical case from filesystem
-      w_string_t *canon_name;
-      w_string_t *lc_file_name;
-      struct watchman_file *lc_file = NULL;
-
-      if (pre_stat || !via_notify) {
-        // Optimization: if we're reading the dir, or were passed this path
-        // as part of a recursive walk, then we assume that the name we were
-        // given is already the canonical name
-        canon_name = file_name;
-        w_string_addref(canon_name);
-      } else {
-        canon_name = w_resolve_filesystem_canonical_name(path);
-      }
-
-      if (canon_name == NULL) {
-        // TOCTOU race: file disappeared (deleted? ran out of memory?) in
-        // between the lstat above and w_resolve_filesystem_canonical_name. Now
-        // that it's deleted, update our state to reflect that.
-        if (errno == ENOENT || errno == ENOTDIR || errno == ENOFOLLOWSYMLINK) {
-          if (dir_ent) {
-            handle_open_errno(root, dir_ent, now, "getattrlist", errno, NULL);
-          }
-          if (file) {
-            w_log(W_LOG_DBG, "getattrlist(%s) -> %s so marking %.*s deleted\n",
-                  path, strerror(err), file->name->len, file->name->buf);
-            file->exists = false;
-            w_root_mark_file_changed(root, file, now);
-          }
-
-          goto out;
-        }
-
-        w_log(W_LOG_FATAL, "getattrlist(CMN_NAME: %s): fail %s\n",
-              path, strerror(errno));
-      }
-
-      if (!w_string_equal(file_name, canon_name)) {
-        // Revise `path` to use the canonical name
-        // We do this by walking back file_name->len, then adding
-        // canon_name on the end.  We can't assume that canon_name
-        // and file_name have the same byte length because the case
-        // folded representation may potentially have differing
-        // byte lengths.  Since the length can change, we need to
-        // re-check the resultant length for overflow.
-        if (full_path->len - file_name->len + canon_name->len > sizeof(path)-1)
-        {
-          w_log(W_LOG_FATAL, "canon path %.*s%.*s is too big\n",
-            full_path->len - file_name->len, full_path->buf,
-            canon_name->len, canon_name->buf);
-        }
-
-        snprintf(path, sizeof(path), "%.*s%.*s",
-          full_path->len - file_name->len, full_path->buf,
-          canon_name->len, canon_name->buf);
-
-        w_log(W_LOG_DBG,
-            "did canon -> %s full={%.*s} file={%.*s} canon={%.*s}\n", path,
-            full_path->len, full_path->buf,
-            file_name->len, file_name->buf,
-            canon_name->len, canon_name->buf);
-
-        // file refers to a node that doesn't exist any longer
-        file->exists = false;
-        w_root_mark_file_changed(root, file, now);
-
-        // Create or resurrect a file node from this canonical name
-        file = w_root_resolve_file(root, dir, canon_name, now);
-      }
-
-      if (dir_ent) {
-        w_string_t *dir_basename = w_string_basename(dir_ent->path);
-
-        if (!w_string_equal(dir_basename, canon_name)) {
-          // If the case changed, we logically deleted that part of
-          // the tree.  Our clients will expect to see deletes for
-          // the tree, followed by notifications of the files at their
-          // new canonical path name
-          w_log(W_LOG_DBG, "canon(%s) changed on dir, so marking deleted\n",
-              path);
-
-          stop_watching_dir(root, dir_ent);
-          w_root_mark_deleted(root, dir_ent, now, true);
-
-          // Ensure we recurse and build out the new tree
-          recursive = true;
-          dir_ent = NULL;
-        }
-        w_string_delref(dir_basename);
-      }
-
-      lc_file_name = w_string_dup_lower(file_name);
-
-      if (!dir->lc_files) {
-        dir->lc_files = w_ht_new(2, &w_ht_string_funcs);
-      } else {
-        lc_file = w_ht_val_ptr(w_ht_get(dir->lc_files,
-                      w_ht_ptr_val(lc_file_name)));
-        if (lc_file && !w_string_equal(lc_file->name, file->name)) {
-          // lc_file is no longer the canonical item, it must have
-          // been deleted
-          lc_file->exists = false;
-          w_root_mark_file_changed(root, lc_file, now);
-        }
-      }
-
-      // Revise lc_files to reference the latest version of this
-      w_ht_replace(dir->lc_files, w_ht_ptr_val(lc_file_name),
-                   w_ht_ptr_val(file));
-      w_string_delref(lc_file_name);
-      lc_file_name = NULL;
-
-      if (!w_string_equal(file_name, canon_name)) {
-        // Ensure that we use the canonical name for the remainder
-        // of this function call
-        w_string_delref(file_name);
-        file_name = canon_name;
-        canon_name = NULL;
-
-        // We don't delref full_path here, it's owned by the caller
-        full_path = w_string_path_cat(dir_name, file_name);
-      } else {
-        w_string_delref(canon_name);
-      }
     }
 
     if (!file->exists) {
@@ -1053,7 +924,7 @@ static void stat_path(w_root_t *root,
           // called for the root itself)
           w_string_equal(full_path, root->query_cookie_dir)) {
 
-        if (!watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
+        if (!root->watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
           /* we always need to crawl, but may not need to be fully recursive */
           w_pending_coll_add(coll, full_path, now,
               W_PENDING_CRAWL_ONLY | (recursive ? W_PENDING_RECURSIVE : 0));
@@ -1074,11 +945,11 @@ static void stat_path(w_root_t *root,
       // our former tree here
       w_root_mark_deleted(root, dir_ent, now, true);
     }
-    if ((watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) &&
+    if ((root->watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) &&
         !S_ISDIR(st.mode) &&
         !w_string_equal(dir_name, root->root_path)) {
       /* Make sure we update the mtime on the parent directory. */
-      stat_path(root, coll, dir_name, now, false, via_notify, NULL);
+      stat_path(root, coll, dir_name, now, flags & W_PENDING_VIA_NOTIFY, NULL);
     }
   }
 
@@ -1114,7 +985,7 @@ void w_root_process_path(w_root_t *root,
   if (w_string_startswith(full_path, root->query_cookie_prefix)) {
     struct watchman_query_cookie *cookie;
     bool consider_cookie =
-      (watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) ?
+      (root->watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) ?
       ((flags & W_PENDING_VIA_NOTIFY) || !root->done_initial) : true;
 
     if (!consider_cookie) {
@@ -1137,11 +1008,11 @@ void w_root_process_path(w_root_t *root,
   }
 
   if (w_string_equal(full_path, root->root_path)
-      || flags & W_PENDING_CRAWL_ONLY) {
-    crawler(root, coll, full_path, now, flags & W_PENDING_RECURSIVE);
+      || (flags & W_PENDING_CRAWL_ONLY) == W_PENDING_CRAWL_ONLY) {
+    crawler(root, coll, full_path, now,
+        (flags & W_PENDING_RECURSIVE) == W_PENDING_RECURSIVE);
   } else {
-    stat_path(root, coll, full_path, now, flags & W_PENDING_RECURSIVE,
-        flags & W_PENDING_VIA_NOTIFY, pre_stat);
+    stat_path(root, coll, full_path, now, flags, pre_stat);
   }
 }
 
@@ -1272,8 +1143,8 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
   char path[WATCHMAN_NAME_MAX];
   bool stat_all = false;
 
-  if (watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
-    stat_all = watcher_ops->flags & WATCHER_COALESCED_RENAME;
+  if (root->watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
+    stat_all = root->watcher_ops->flags & WATCHER_COALESCED_RENAME;
   } else {
     // If the watcher doesn't give us per-file notifications for
     // watched dirs, then we'll end up explicitly tracking them
@@ -1293,7 +1164,7 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
   /* Start watching and open the dir for crawling.
    * Whether we open the dir prior to watching or after is watcher specific,
    * so the operations are rolled together in our abstraction */
-  osdir = watcher_ops->root_start_watch_dir(watcher, root, dir, now, path);
+  osdir = root->watcher_ops->root_start_watch_dir(root, dir, now, path);
   if (!osdir) {
     return;
   }
@@ -1313,8 +1184,8 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
     // If it is less than 2 then it doesn't follow that convention.
     // We just pass it through for the dir size hint and the hash
     // table implementation will round that up to the next power of 2
-    apply_dir_size_hint(root, dir, num_dirs,
-        (uint32_t)cfg_get_int(root, "hint_num_files_per_dir", 64));
+    apply_dir_size_hint(dir, num_dirs, (uint32_t)cfg_get_int(
+                                           root, "hint_num_files_per_dir", 64));
   }
 
   /* flag for delete detection */
@@ -1350,8 +1221,14 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
       w_string_t *full_path = w_string_path_cat_cstr(dir->path,
                                 dirent->d_name);
       if (full_path) {
+        w_log(W_LOG_DBG, "in crawler[%.*s], calling process_path on %.*s\n",
+            dir->path->len, dir->path->buf,
+            full_path->len, full_path->buf);
         w_root_process_path(root, coll, full_path, now,
-            W_PENDING_RECURSIVE, dirent);
+                                ((recursive || !file || !file->exists)
+                                     ? W_PENDING_RECURSIVE
+                                     : 0),
+                            dirent);
         w_string_delref(full_path);
       } else {
         w_log(W_LOG_ERR, "OOM during crawl\n");
@@ -1431,11 +1308,13 @@ static void process_subscriptions(w_root_t *root)
   vcs_in_progress = is_vcs_op_in_progress(root);
 
   do {
-    struct watchman_client *client = w_ht_val_ptr(iter.value);
+    struct watchman_user_client *client = w_ht_val_ptr(iter.value);
     w_ht_iter_t citer;
 
     if (w_ht_first(client->subscriptions, &citer)) do {
       struct watchman_client_subscription *sub = w_ht_val_ptr(citer.value);
+      bool defer = false;
+      bool drop = false;
 
       if (sub->root != root) {
         w_log(W_LOG_DBG, "root doesn't match, skipping\n");
@@ -1443,11 +1322,58 @@ static void process_subscriptions(w_root_t *root)
       }
       w_log(W_LOG_DBG, "client->stm=%p sub=%p %s, last=%" PRIu32
           " pending=%" PRIu32 "\n",
-          client->stm, sub, sub->name->buf, sub->last_sub_tick,
+          client->client.stm, sub, sub->name->buf, sub->last_sub_tick,
           root->pending_sub_tick);
 
       if (sub->last_sub_tick == root->pending_sub_tick) {
         continue;
+      }
+
+      if (root->asserted_states && w_ht_size(root->asserted_states) > 0
+          && sub->drop_or_defer) {
+        w_ht_iter_t policy_iter;
+        w_string_t *policy_name = NULL;
+
+        // There are 1 or more states asserted and this subscription
+        // has some policy for states.  Figure out what we should do.
+        if (w_ht_first(sub->drop_or_defer, &policy_iter)) do {
+          w_string_t *name = w_ht_val_ptr(policy_iter.key);
+          bool policy_is_drop = policy_iter.value;
+
+          if (!w_ht_get(root->asserted_states, policy_iter.key)) {
+            continue;
+          }
+
+          if (!defer) {
+            // This policy is active
+            defer = true;
+            policy_name = name;
+          }
+
+          if (policy_is_drop) {
+            drop = true;
+
+            // If we're dropping, we don't need to look at any
+            // other policies
+            policy_name = name;
+            break;
+          }
+          // Otherwise keep looking until we find a drop
+        } while (w_ht_next(sub->drop_or_defer, &policy_iter));
+
+        if (drop) {
+          // fast-forward over any notifications while in the drop state
+          sub->last_sub_tick = root->pending_sub_tick;
+          w_log(W_LOG_DBG, "dropping subscription notifications for %s "
+              "until state %s is vacated\n", sub->name->buf, policy_name->buf);
+          continue;
+        }
+
+        if (defer) {
+          w_log(W_LOG_DBG, "deferring subscription notifications for %s "
+              "until state %s is vacated\n", sub->name->buf, policy_name->buf);
+          continue;
+        }
       }
 
       if (sub->vcs_defer && vcs_in_progress) {
@@ -1507,6 +1433,105 @@ static void process_triggers(w_root_t *root)
   root->last_trigger_tick = root->pending_trigger_tick;
 }
 
+/* fsevents won't tell us about creation events for dangling symlinks;
+ * we have to check to find those for ourselves.  To manage this, every
+ * time we transition into being initially settled, we'll collect a
+ * list of dirs that were modified since the last settle event and rescan
+ * them (non-recursive).
+ * We'll do this inspection in the context of the IO thread.
+ * If we return true it means that we found something that the watcher
+ * missed.
+ */
+static bool recheck_dirs(w_root_t *root,
+    struct watchman_pending_collection *coll) {
+  struct watchman_file *f;
+  struct timeval now;
+
+  if (root->last_recheck_tick >= root->ticks) {
+    return false;
+  }
+
+  w_log(W_LOG_DBG, "recheck!, last_recheck_tick=%d root->ticks=%d\n",
+        root->last_recheck_tick, root->ticks);
+
+  gettimeofday(&now, NULL);
+
+  // First pass: collect a list of recently changed dirs
+  for (f = root->latest_file; f; f = f->next) {
+    // check dirs, but only if we've seen them change recently
+    if (f->otime.ticks <= root->last_recheck_tick) {
+      continue;
+    }
+
+    if (S_ISDIR(f->stat.mode)) {
+      // This was a dir, so check it again
+      w_pending_coll_add_rel(coll, f->parent, f->name->buf, now, 0);
+    } else {
+      // Crawl the parent dir
+      w_pending_coll_add(coll, f->parent->path, now, 0);
+    }
+  }
+
+  if (w_pending_coll_size(coll) == 0) {
+    // We're all up to date
+    root->last_recheck_tick = root->ticks;
+    w_log(W_LOG_DBG,
+          "recheck complete, last_recheck_tick=%d root->ticks=%d\n",
+          root->last_recheck_tick, root->ticks);
+    return false;
+  }
+
+  w_log(W_LOG_DBG, "Re-checking %d dirs (before considering symlinks)\n",
+      w_pending_coll_size(coll));
+
+  // Now that we know that something recently changed, let's go looking
+  // for symlinks and explicitly check their containing dirs for changes too
+  for (f = root->latest_file; f; f = f->next) {
+    if (S_ISLNK(f->stat.mode) && f->exists) {
+      // Re-examine this symlink
+      w_pending_coll_add_rel(coll, f->parent, f->name->buf, now, 0);
+      // and re-crawl its parent dir to discover other potentially newly
+      // created symlinks that were previously dangling
+      w_pending_coll_add(coll, f->parent->path, now, 0);
+    }
+  }
+
+  w_log(W_LOG_DBG, "Re-checking %d dirs (after considering symlinks)\n",
+      w_pending_coll_size(coll));
+  // Move the recheck window forward, and bump the tick counter
+  // ready to observe anything new in the crawl(s) that we trigger next
+  root->last_recheck_tick = root->ticks++;
+
+  // Now re-examine the list of dirs
+  while (w_root_process_pending(root, coll, false)) {
+    ;
+  }
+  w_log(W_LOG_DBG, "recheck complete, last_recheck_tick=%d root->ticks=%d\n",
+        root->last_recheck_tick, root->ticks);
+
+  // This is a bit icky, but let's find out how many things we observed
+  // change as a result of this check; if none, then we return false
+  for (f = root->latest_file; f; f = f->next) {
+    if (f->otime.ticks <= root->last_recheck_tick) {
+      // No more changes in the appropriate time range;
+      // nothing changed as a result of this recheck
+      return false;
+    }
+    if (f->otime.ticks == root->ticks) {
+      // Yep, something was updated.
+      // Log what it was so that we can debug situations where we don't
+      // really settle.
+      w_log(W_LOG_DBG, "Re-check: %.*s/%.*s was updated at tick=%d\n",
+          f->parent->path->len, f->parent->path->buf,
+          f->name->len, f->name->buf,
+          f->otime.ticks);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static bool handle_should_recrawl(w_root_t *root)
 {
   if (root->should_recrawl && !root->cancelled) {
@@ -1520,7 +1545,7 @@ static bool handle_should_recrawl(w_root_t *root)
       w_root_cancel(root);
     }
     root->recrawl_count++;
-    if (!watcher_ops->root_start(watcher, root)) {
+    if (!root->watcher_ops->root_start(root)) {
       w_log(W_LOG_ERR, "failed to start root %.*s, cancelling watch: %.*s\n",
           root->root_path->len, root->root_path->buf,
           root->failure_reason->len, root->failure_reason->buf);
@@ -1534,18 +1559,18 @@ static bool handle_should_recrawl(w_root_t *root)
 
 static bool wait_for_notify(w_root_t *root, int timeoutms)
 {
-  return watcher_ops->root_wait_notify(watcher, root, timeoutms);
+  return root->watcher_ops->root_wait_notify(root, timeoutms);
 }
 
 static bool consume_notify(w_root_t *root,
     struct watchman_pending_collection *coll)
 {
-  return watcher_ops->root_consume_notify(watcher, root, coll);
+  return root->watcher_ops->root_consume_notify(root, coll);
 }
 
-static void free_file_node(struct watchman_file *file)
+static void free_file_node(w_root_t *root, struct watchman_file *file)
 {
-  watcher_ops->file_free(watcher, file);
+  root->watcher_ops->file_free(file);
   w_string_delref(file->name);
   free(file);
 }
@@ -1591,17 +1616,6 @@ static void age_out_file(w_root_t *root, w_ht_t *aged_dir_names,
     // Remove the entry from the containing dir hash
     w_ht_del(file->parent->dirs, w_ht_ptr_val(full_name));
   }
-  if (file->parent->lc_files) {
-    // Remove the entry from the containing lower case files hash,
-    // but only it it matches us (it may point to a different file
-    // node with a differently-cased name)
-    w_string_t *lc_name = w_string_dup_lower(file->name);
-    if (w_ht_get(file->parent->lc_files, w_ht_ptr_val(lc_name))
-        == w_ht_ptr_val(file)) {
-      w_ht_del(file->parent->lc_files, w_ht_ptr_val(lc_name));
-    }
-    w_string_delref(lc_name);
-  }
 
   // resolve the dir of the same name and mark it for later removal
   // from our internal datastructures
@@ -1612,7 +1626,7 @@ static void age_out_file(w_root_t *root, w_ht_t *aged_dir_names,
 
   // And free it.  We don't need to stop watching it, because we already
   // stopped watching it when we marked it as !exists
-  free_file_node(file);
+  free_file_node(root, file);
 
   w_string_delref(full_name);
 }
@@ -1688,7 +1702,7 @@ static bool root_has_subscriptions(w_root_t *root) {
 
   pthread_mutex_lock(&w_client_lock);
   if (w_ht_first(clients, &iter)) do {
-    struct watchman_client *client = w_ht_val_ptr(iter.value);
+    struct watchman_user_client *client = w_ht_val_ptr(iter.value);
     w_ht_iter_t citer;
 
     if (w_ht_first(client->subscriptions, &citer)) do {
@@ -1768,7 +1782,7 @@ static void notify_thread(w_root_t *root)
     return;
   }
 
-  if (!watcher_ops->root_start(watcher, root)) {
+  if (!root->watcher_ops->root_start(root)) {
     w_log(W_LOG_ERR, "failed to start root %.*s, cancelling watch: %.*s\n",
         root->root_path->len, root->root_path->buf,
         root->failure_reason->len, root->failure_reason->buf);
@@ -1804,7 +1818,7 @@ static void notify_thread(w_root_t *root)
       }
     }
 
-    w_root_lock(root);
+    w_root_lock(root, "notify_thread: handle_should_recrawl");
     handle_should_recrawl(root);
     w_root_unlock(root);
   }
@@ -1814,7 +1828,7 @@ static void notify_thread(w_root_t *root)
 
 static void io_thread(w_root_t *root)
 {
-  int timeoutms, biggest_timeout;
+  int timeoutms, biggest_timeout, recheck_timeout;
   struct watchman_pending_collection pending;
 
   timeoutms = root->trigger_settle;
@@ -1831,6 +1845,9 @@ static void io_thread(w_root_t *root)
   // And convert to milliseconds
   biggest_timeout *= 1000;
 
+  recheck_timeout = (int)cfg_get_int(root, "recheck_dirs_interval_ms", 0);
+  recheck_timeout = MIN(recheck_timeout, biggest_timeout);
+
   w_pending_coll_init(&pending);
 
   while (!root->cancelled) {
@@ -1838,22 +1855,38 @@ static void io_thread(w_root_t *root)
 
     if (!root->done_initial) {
       struct timeval start;
+      w_perf_t sample;
+
+      w_perf_start(&sample, "full-crawl");
 
       /* first order of business is to find all the files under our root */
       if (cfg_get_bool(root, "iothrottle", false)) {
         w_ioprio_set_low();
       }
-      w_root_lock(root);
+      w_root_lock(root, "io_thread: bump ticks");
+      // Ensure that we observe these files with a new, distinct clock,
+      // otherwise a fresh subscription established immediately after a watch
+      // can get stuck with an empty view until another change is observed
+      root->ticks++;
       gettimeofday(&start, NULL);
       w_pending_coll_add(&root->pending, root->root_path, start, 0);
       while (w_root_process_pending(root, &pending, true)) {
         ;
       }
       root->done_initial = true;
+      // We just crawled everything, no need to recheck right now
+      root->last_recheck_tick = root->ticks + 1;
+      w_perf_add_root_meta(&sample, root);
       w_root_unlock(root);
+
       if (cfg_get_bool(root, "iothrottle", false)) {
         w_ioprio_set_normal();
       }
+
+      w_perf_finish(&sample);
+      w_perf_force_log(&sample);
+      w_perf_log(&sample);
+      w_perf_destroy(&sample);
 
       w_log(W_LOG_ERR, "%scrawl complete\n", root->recrawl_count ? "re" : "");
       timeoutms = root->trigger_settle;
@@ -1869,13 +1902,23 @@ static void io_thread(w_root_t *root)
 
     if (!pinged && w_pending_coll_size(&pending) == 0) {
       // No new pending items were given to us, so consider that
-      // we may not be settled.
+      // we may now be settled.
 
-      w_root_lock(root);
+      w_root_lock(root, "io_thread: settle out");
       if (!root->done_initial) {
         // we need to recrawl, stop what we're doing here
         w_root_unlock(root);
         continue;
+      }
+
+      // If we just settled, the timeout will be the base timeout.
+      // This is an appropriate time to second guess the watcher
+      // and locate anything that we think we may have missed
+      if (recheck_timeout > 0 && timeoutms >= recheck_timeout) {
+        if (recheck_dirs(root, &pending)) {
+          // We're no longer settled, so reset the timeout
+          timeoutms = root->trigger_settle;
+        }
       }
 
       process_subscriptions(root);
@@ -1898,7 +1941,7 @@ static void io_thread(w_root_t *root)
     // to the settle duration ready for the next loop through
     timeoutms = root->trigger_settle;
 
-    w_root_lock(root);
+    w_root_lock(root, "io_thread: process notifications");
     if (!root->done_initial) {
       // we need to recrawl.  Discard these notifications
       w_pending_coll_drain(&pending);
@@ -1921,44 +1964,6 @@ static void io_thread(w_root_t *root)
   w_pending_coll_destroy(&pending);
 }
 
-/* This function always returns a buffer that needs to
- * be released via free(3).  We use the native feature
- * of the system libc if we know it is present, otherwise
- * we need to malloc a buffer for ourselves.  This
- * is made more fun because some systems have a dynamic
- * buffer size obtained via sysconf().
- */
-char *w_realpath(const char *filename)
-{
-#if defined(__GLIBC__) || defined(__APPLE__) || defined(_WIN32)
-  return realpath(filename, NULL);
-#else
-  char *buf = NULL;
-  char *retbuf;
-  int path_max = 0;
-
-#ifdef _SC_PATH_MAX
-  path_max = sysconf(path, _SC_PATH_MAX);
-#endif
-  if (path_max <= 0) {
-    path_max = WATCHMAN_NAME_MAX;
-  }
-  buf = malloc(path_max);
-  if (!buf) {
-    return NULL;
-  }
-
-  retbuf = realpath(filename, buf);
-
-  if (retbuf != buf) {
-    free(buf);
-    return NULL;
-  }
-
-  return retbuf;
-#endif
-}
-
 void w_root_addref(w_root_t *root)
 {
   w_refcnt_add(&root->refcnt);
@@ -1968,7 +1973,9 @@ static void w_root_teardown(w_root_t *root)
 {
   struct watchman_file *file;
 
-  watcher_ops->root_dtor(watcher, root);
+  if (root->watcher_ops) {
+    root->watcher_ops->root_dtor(root);
+  }
 
   if (root->dirname_to_dir) {
     w_ht_free(root->dirname_to_dir);
@@ -1979,7 +1986,7 @@ static void w_root_teardown(w_root_t *root)
   while (root->latest_file) {
     file = root->latest_file;
     root->latest_file = file->next;
-    free_file_node(file);
+    free_file_node(root, file);
   }
 
   if (root->cursors) {
@@ -1998,6 +2005,7 @@ void w_root_delref(w_root_t *root)
 
   w_log(W_LOG_DBG, "root: final ref on %s\n",
       root->root_path->buf);
+  w_cancel_subscriptions_for_root(root);
 
   w_root_teardown(root);
 
@@ -2061,32 +2069,6 @@ static const struct watchman_hash_funcs root_funcs = {
 
 void watchman_watcher_init(void) {
   watched_roots = w_ht_new(4, &root_funcs);
-
-#if HAVE_FSEVENTS
-  watcher_ops = &fsevents_watcher;
-#elif defined(HAVE_PORT_CREATE)
-  // We prefer portfs if you have both portfs and inotify on the assumption
-  // that this is an Illumos based system with both and that the native
-  // mechanism will yield more correct behavior.
-  // https://github.com/facebook/watchman/issues/84
-  watcher_ops = &portfs_watcher;
-#elif defined(HAVE_INOTIFY_INIT)
-  watcher_ops = &inotify_watcher;
-#elif defined(HAVE_KQUEUE)
-  watcher_ops = &kqueue_watcher;
-#elif defined(_WIN32)
-  watcher_ops = &win32_watcher;
-#else
-# error you need to assign watcher_ops for this system
-#endif
-
-  watcher = watcher_ops->global_init();
-
-  w_log(W_LOG_ERR, "Using watcher mechanism %s\n", watcher_ops->name);
-}
-
-void watchman_watcher_dtor(void) {
-  watcher_ops->global_dtor(watcher);
 }
 
 // Must not be called with root->lock held :-/
@@ -2358,7 +2340,7 @@ static w_root_t *root_resolve(const char *filename, bool auto_watch,
     // to a client querying something about the root and should extend
     // the lifetime of the root
     if (root) {
-      w_root_lock(root);
+      w_root_lock(root, "root_resolve: last_cmd_timestamp");
       time(&root->last_cmd_timestamp);
       w_root_unlock(root);
     }
@@ -2503,7 +2485,7 @@ w_root_t *w_root_resolve_for_client_mode(const char *filename, char **errmsg)
 
     /* force a walk now */
     gettimeofday(&start, NULL);
-    w_root_lock(root);
+    w_root_lock(root, "w_root_resolve_for_client_mode");
     w_pending_coll_add(&root->pending, root->root_path,
         start, W_PENDING_RECURSIVE);
     while (w_root_process_pending(root, &pending, true)) {
@@ -2524,7 +2506,7 @@ static void signal_root_threads(w_root_t *root)
     pthread_kill(root->notify_thread, SIGUSR1);
   }
   w_pending_coll_ping(&root->pending);
-  watcher_ops->root_signal_threads(watcher, root);
+  root->watcher_ops->root_signal_threads(root);
 }
 
 void w_root_schedule_recrawl(w_root_t *root, const char *why)
@@ -2695,7 +2677,7 @@ bool w_root_load_state(json_t *state)
       continue;
     }
 
-    w_root_lock(root);
+    w_root_lock(root, "w_root_load_state");
 
     /* re-create the trigger configuration */
     for (j = 0; j < json_array_size(triggers); j++) {
@@ -2758,7 +2740,7 @@ bool w_root_save_state(json_t *state)
 
     json_object_set_new(obj, "path", w_string_to_json(root->root_path));
 
-    w_root_lock(root);
+    w_root_lock(root, "w_root_save_state");
     triggers = w_root_trigger_list_to_json(root);
     w_root_unlock(root);
     json_object_set_new(obj, "triggers", triggers);
@@ -2772,32 +2754,6 @@ bool w_root_save_state(json_t *state)
   json_object_set_new(state, "watched", watched_dirs);
 
   return result;
-}
-
-bool w_reap_children(bool block)
-{
-  pid_t pid;
-  int reaped = 0;
-
-  // Reap any children so that we can release their
-  // references on the root
-  do {
-#ifndef _WIN32
-    int st;
-    pid = waitpid(-1, &st, block ? 0 : WNOHANG);
-    if (pid == -1) {
-      break;
-    }
-#else
-    if (!w_wait_for_any_child(block ? INFINITE : 0, &pid)) {
-      break;
-    }
-#endif
-    w_mark_dead(pid);
-    reaped++;
-  } while (1);
-
-  return reaped != 0;
 }
 
 void w_root_free_watched_roots(void)

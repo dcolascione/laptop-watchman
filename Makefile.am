@@ -16,6 +16,7 @@ watchman_SOURCES = \
 	spawn.c       \
 	opt.c        \
 	cfg.c        \
+	clockspec.c  \
 	checksock.c  \
 	fstype.c     \
 	log.c        \
@@ -27,15 +28,18 @@ watchman_SOURCES = \
 	ioprio.c        \
 	opendir.c       \
 	pending.c       \
+	perf.c          \
 	stream.c        \
 	stream_stdout.c \
 	stream_unix.c   \
+	timedlock.c     \
 	cmds/find.c     \
 	cmds/info.c     \
 	cmds/log.c      \
 	cmds/query.c    \
 	cmds/since.c    \
 	cmds/reg.c      \
+	cmds/state.c    \
 	cmds/subscribe.c    \
 	cmds/trigger.c  \
 	cmds/watch.c    \
@@ -53,23 +57,30 @@ watchman_SOURCES = \
 	query/fieldlist.c  \
 	query/since.c      \
 	query/empty.c      \
+	watcher/auto.c     \
 	watcher/fsevents.c \
 	watcher/helper.c   \
 	watcher/inotify.c  \
 	watcher/kqueue.c   \
 	watcher/portfs.c   \
+	launchd.c    \
 	listener.c   \
+	listener-user.c   \
 	clientmode.c \
 	main.c       \
 	root.c       \
 	state.c      \
-	string.c
+	string.c     \
+	time.c
 
 noinst_HEADERS =   \
 	watchman.h       \
 	watchman_hash.h
 
-noinst_LIBRARIES = libwmanjson.a libtap.a libwildmatch.a
+noinst_LIBRARIES = \
+	libtap.a \
+	libwildmatch.a \
+	libwmanjson.a
 
 # bundled json library
 libwmanjson_a_CPPFLAGS = $(THIRDPARTY_CPPFLAGS)
@@ -99,8 +110,12 @@ libwildmatch_a_SOURCES = thirdparty/wildmatch/wildmatch.c
 WILDMATCH_LIB = libwildmatch.a
 
 # unit tests
-TESTS = tests/argv.t tests/log.t tests/bser.t tests/wildmatch.t
-noinst_PROGRAMS = tests/argv.t tests/log.t tests/bser.t tests/wildmatch.t
+TESTS = \
+		tests/argv.t \
+		tests/bser.t \
+		tests/log.t \
+		tests/wildmatch.t
+noinst_PROGRAMS = $(TESTS)
 
 if ARCLINT
 # Run lint and output stuff suitable for feeding into ":make" in vim
@@ -124,7 +139,7 @@ py-tests:
 	$(PYTHON) $(TESTNAME)
 
 py-integration:
-	$(PYTHON) runtests.py
+	$(PYTHON) runtests.py --keep-if-fail
 
 py-clean:
 	-cd python && $(PYTHON) ./setup.py clean --all

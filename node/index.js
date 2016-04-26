@@ -1,6 +1,8 @@
 /* Copyright 2014-present Facebook, Inc.
  * Licensed under the Apache License, Version 2.0 */
 
+'use strict';
+
 var net = require('net');
 var EE = require('events').EventEmitter;
 var util = require('util');
@@ -116,7 +118,9 @@ Client.prototype.connect = function() {
       self.emit('error', err);
     });
     self.socket.on('data', function(buf) {
-      self.bunser.append(buf);
+      if (self.bunser) {
+        self.bunser.append(buf);
+      }
     });
     self.socket.on('end', function() {
       self.socket = null;
@@ -189,17 +193,18 @@ Client.prototype.connect = function() {
     spawnError(error);
   });
 
-  proc.on('close', function (code) {
+  proc.on('close', function (code, signal) {
     if (code !== 0) {
       spawnError(new Error(
-          self.watchmanBinaryPath + args.join(' ') +
-          ' returned with exit code ' + code + ' ' + stderr.join('')));
+          self.watchmanBinaryPath + ' ' + args.join(' ') +
+          ' returned with exit code=' + code + ', signal=' +
+          signal + ', stderr= ' + stderr.join('')));
       return;
     }
     try {
       var obj = JSON.parse(stdout.join(''));
       if ('error' in obj) {
-        error = new Error(obj.error);
+        var error = new Error(obj.error);
         error.watchmanResponse = obj;
         self.emit('error', error);
         return;
@@ -231,7 +236,7 @@ Client.prototype.command = function(args, done) {
   this.sendNextCommand();
 }
 
-cap_versions = {
+var cap_versions = {
     "cmd-watch-del-all": "3.1.1",
     "cmd-watch-project": "3.1",
     "relative_root": "3.3",
@@ -244,8 +249,8 @@ cap_versions = {
 function vers_compare(a, b) {
   a = a.split('.');
   b = b.split('.');
-  for (i = 0; i < 3; i++) {
-    d = parseInt(a[i] || '0') - parseInt(b[i] || '0');
+  for (var i = 0; i < 3; i++) {
+    var d = parseInt(a[i] || '0') - parseInt(b[i] || '0');
     if (d != 0) {
       return d;
     }
@@ -264,7 +269,7 @@ function have_cap(vers, name) {
 Client.prototype._synthesizeCapabilityCheck = function(
     resp, optional, required) {
   resp.capabilities = {}
-  version = resp.version;
+  var version = resp.version;
   optional.forEach(function (name) {
     resp.capabilities[name] = have_cap(version, name);
   });

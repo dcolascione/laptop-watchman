@@ -25,6 +25,7 @@ SRCS=\
 	winbuild\stat.c \
 	winbuild\realpath.c \
 	winbuild\dir.c \
+	winbuild\dirname.c \
 	winbuild\asprintf.c \
 	winbuild\hostname.c \
 	thirdparty\wildmatch\wildmatch.c \
@@ -38,6 +39,7 @@ SRCS=\
 	spawn.c \
 	opt.c \
 	cfg.c \
+	clockspec.c \
 	checksock.c \
 	fstype.c     \
 	log.c        \
@@ -48,6 +50,7 @@ SRCS=\
 	ioprio.c     \
 	opendir.c    \
 	pending.c    \
+	perf.c       \
 	stream.c     \
 	stream_win.c \
 	stream_stdout.c \
@@ -58,6 +61,7 @@ SRCS=\
 	cmds\query.c    \
 	cmds\since.c    \
 	cmds\reg.c      \
+	cmds\state.c    \
 	cmds\subscribe.c    \
 	cmds\trigger.c  \
 	cmds\watch.c    \
@@ -75,14 +79,17 @@ SRCS=\
 	query\intcompare.c  \
 	query\since.c      \
 	query\empty.c      \
+	watcher\auto.c \
 	watcher\win32.c \
 	watcher\helper.c \
 	listener.c   \
+	listener-user.c   \
 	clientmode.c \
 	main.c       \
 	root.c       \
 	state.c      \
-	string.c
+	string.c     \
+	time.c
 
 TEST_SRCS=\
 	thirdparty\tap.c \
@@ -167,7 +174,7 @@ py-build:
 	cd python && python ./setup.py clean build_py -c -d . build_ext -i
 
 py-integration: py-build
-	python runtests.py
+	python -u runtests.py
 
 # helper for suspending/resuming a target process
 susres.exe: winbuild\susres.c

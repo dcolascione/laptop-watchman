@@ -23,7 +23,7 @@ static void cmd_debug_recrawl(struct watchman_client *client, json_t *args)
 
   resp = make_response();
 
-  w_root_lock(root);
+  w_root_lock(root, "debug-recrawl");
   w_root_schedule_recrawl(root, "debug-recrawl");
   w_root_unlock(root);
 
@@ -54,7 +54,7 @@ static void cmd_debug_show_cursors(struct watchman_client *client, json_t *args)
 
   resp = make_response();
 
-  w_root_lock(root);
+  w_root_lock(root, "debug-show-cursors");
   cursors = json_object_of_size(w_ht_size(root->cursors));
   if (w_ht_first(root->cursors, &i)) do {
     w_string_t *name = w_ht_val_ptr(i.key);
@@ -93,7 +93,7 @@ static void cmd_debug_ageout(struct watchman_client *client, json_t *args)
 
   resp = make_response();
 
-  w_root_lock(root);
+  w_root_lock(root, "debug-ageout");
   w_root_perform_age_out(root, min_age);
   w_root_unlock(root);
 
@@ -127,6 +127,19 @@ static void cmd_debug_poison(struct watchman_client *client, json_t *args)
   w_root_delref(root);
 }
 W_CMD_REG("debug-poison", cmd_debug_poison, CMD_DAEMON, w_cmd_realpath_root)
+
+static void cmd_debug_drop_privs(struct watchman_client *client, json_t *args)
+{
+  json_t *resp;
+
+  unused_parameter(args);
+  client->client_is_owner = false;
+
+  resp = make_response();
+  set_prop(resp, "owner", json_boolean(client->client_is_owner));
+  send_and_dispose_response(client, resp);
+}
+W_CMD_REG("debug-drop-privs", cmd_debug_drop_privs, CMD_DAEMON, NULL);
 
 /* vim:ts=2:sw=2:et:
  */

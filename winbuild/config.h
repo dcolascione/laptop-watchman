@@ -51,7 +51,7 @@ static inline long __sync_add_and_fetch(volatile long *target, long add) {
 }
 
 const char *win32_strerror(DWORD err);
-char *w_win_unc_to_utf8(WCHAR *wpath, int pathlen);
+char *w_win_unc_to_utf8(WCHAR *wpath, int pathlen, uint32_t *outlen);
 WCHAR *w_utf8_to_win_unc(const char *path, int pathlen);
 int map_win32_err(DWORD err);
 int map_winsock_err(void);
@@ -68,6 +68,7 @@ int map_winsock_err(void);
 #define snprintf _snprintf
 int asprintf(char **out, WATCHMAN_FMT_STRING(const char *fmt), ...);
 int vasprintf(char **out, WATCHMAN_FMT_STRING(const char *fmt), va_list ap);
+char *dirname(char *path);
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
@@ -78,6 +79,7 @@ char *realpath(const char *filename, char *target);
 
 #define O_DIRECTORY _O_OBTAIN_DIR
 #define O_CLOEXEC _O_NOINHERIT
+#define O_NOFOLLOW 0 /* clowny, but there's no translation */
 
 typedef DWORD pid_t;
 
@@ -138,7 +140,7 @@ char **backtrace_symbols(void **array, size_t n_frames);
 #define PACKAGE_NAME "watchman"
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "4.1.0"
+#define PACKAGE_VERSION "4.5.0"
 
 /* Version number of package */
 #define VERSION PACKAGE_VERSION

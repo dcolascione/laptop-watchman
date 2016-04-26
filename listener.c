@@ -5,16 +5,13 @@
 #ifdef HAVE_LIBGIMLI_H
 # include <libgimli.h>
 #endif
-#ifdef __APPLE__
-#include <launch.h>
-#endif
 
 /* This needs to be recursive safe because we may log to clients
  * while we are dispatching subscriptions to clients */
 pthread_mutex_t w_client_lock;
 w_ht_t *clients = NULL;
 static int listener_fd;
-static pthread_t reaper_thread;
+pthread_t reaper_thread;
 static pthread_t listener_thread;
 #ifdef _WIN32
 static HANDLE listener_thread_event;
@@ -24,6 +21,19 @@ static volatile bool stopping = false;
 static volatile struct gimli_heartbeat *hb = NULL;
 #endif
 
+bool w_is_stopping(void) {
+  return stopping;
+}
+
+void w_client_lock_init(void) {
+  pthread_mutexattr_t mattr;
+
+  pthread_mutexattr_init(&mattr);
+  pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&w_client_lock, &mattr);
+  pthread_mutexattr_destroy(&mattr);
+}
+
 json_t *make_response(void)
 {
   json_t *resp = json_object();
@@ -31,40 +41,6 @@ json_t *make_response(void)
   set_prop(resp, "version", json_string_nocheck(PACKAGE_VERSION));
 
   return resp;
-}
-
-static int proc_pid;
-static uint64_t proc_start_time;
-
-bool clock_id_string(uint32_t root_number, uint32_t ticks, char *buf,
-    size_t bufsize)
-{
-  int res = snprintf(buf, bufsize, "c:%" PRIu64 ":%d:%u:%" PRIu32,
-                     proc_start_time, proc_pid, root_number, ticks);
-
-  if (res == -1) {
-    return false;
-  }
-  return (size_t)res < bufsize;
-}
-
-// Renders the current clock id string to the supplied buffer.
-// Must be called with the root locked.
-static bool current_clock_id_string(w_root_t *root,
-    char *buf, size_t bufsize)
-{
-  return clock_id_string(root->number, root->ticks, buf, bufsize);
-}
-
-/* Add the current clock value to the response.
- * must be called with the root locked */
-void annotate_with_clock(w_root_t *root, json_t *resp)
-{
-  char buf[128];
-
-  if (current_clock_id_string(root, buf, sizeof(buf))) {
-    set_prop(resp, "clock", json_string_nocheck(buf));
-  }
 }
 
 /* must be called with the w_client_lock held */
@@ -109,13 +85,27 @@ void send_error_response(struct watchman_client *client,
   char buf[WATCHMAN_NAME_MAX];
   va_list ap;
   json_t *resp = make_response();
+  json_t *errstr;
 
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
 
-  w_log(W_LOG_ERR, "send_error_response: %s\n", buf);
-  set_prop(resp, "error", json_string_nocheck(buf));
+  errstr = json_string_nocheck(buf);
+  set_prop(resp, "error", errstr);
+
+  json_incref(errstr);
+  w_perf_add_meta(&client->perf_sample, "error", errstr);
+
+  if (client->current_command) {
+    char *command = NULL;
+    command = json_dumps(client->current_command, 0);
+    w_log(W_LOG_ERR, "send_error_response: %s failed: %s\n",
+        command, buf);
+    free(command);
+  } else {
+    w_log(W_LOG_ERR, "send_error_response: %s\n", buf);
+  }
 
   send_and_dispose_response(client, resp);
 }
@@ -125,9 +115,7 @@ static void client_delete(struct watchman_client *client)
   struct watchman_client_response *resp;
 
   w_log(W_LOG_DBG, "client_delete %p\n", client);
-
-  /* cancel subscriptions */
-  w_ht_free(client->subscriptions);
+  derived_client_dtor(client);
 
   while (client->head) {
     resp = client->head;
@@ -144,289 +132,16 @@ static void client_delete(struct watchman_client *client)
   free(client);
 }
 
-static void delete_subscription(w_ht_val_t val)
-{
-  struct watchman_client_subscription *sub = w_ht_val_ptr(val);
-
-  w_string_delref(sub->name);
-  w_query_delref(sub->query);
-  free(sub);
-}
-
-static const struct watchman_hash_funcs subscription_hash_funcs = {
-  w_ht_string_copy,
-  w_ht_string_del,
-  w_ht_string_equal,
-  w_ht_string_hash,
-  NULL,
-  delete_subscription
-};
-
-struct w_clockspec *w_clockspec_new_clock(uint32_t root_number, uint32_t ticks)
-{
-  struct w_clockspec *spec;
-  spec = calloc(1, sizeof(*spec));
-  if (!spec) {
-    return NULL;
-  }
-  spec->tag = w_cs_clock;
-  spec->clock.start_time = proc_start_time;
-  spec->clock.pid = proc_pid;
-  spec->clock.root_number = root_number;
-  spec->clock.ticks = ticks;
-  return spec;
-}
-
-struct w_clockspec *w_clockspec_parse(json_t *value)
-{
-  const char *str;
-  uint64_t start_time;
-  int pid;
-  uint32_t root_number;
-  uint32_t ticks;
-
-  struct w_clockspec *spec;
-
-  spec = calloc(1, sizeof(*spec));
-  if (!spec) {
-    return NULL;
-  }
-
-  if (json_is_integer(value)) {
-    spec->tag = w_cs_timestamp;
-    spec->timestamp.tv_usec = 0;
-    spec->timestamp.tv_sec = (time_t)json_integer_value(value);
-    return spec;
-  }
-
-  str = json_string_value(value);
-  if (!str) {
-    free(spec);
-    return NULL;
-  }
-
-  if (str[0] == 'n' && str[1] == ':') {
-    spec->tag = w_cs_named_cursor;
-    // spec owns the ref to the string
-    spec->named_cursor.cursor = w_string_new(str);
-    return spec;
-  }
-
-  if (sscanf(str, "c:%" PRIu64 ":%d:%" PRIu32 ":%" PRIu32,
-             &start_time, &pid, &root_number, &ticks) == 4) {
-    spec->tag = w_cs_clock;
-    spec->clock.start_time = start_time;
-    spec->clock.pid = pid;
-    spec->clock.root_number = root_number;
-    spec->clock.ticks = ticks;
-    return spec;
-  }
-
-  if (sscanf(str, "c:%d:%" PRIu32, &pid, &ticks) == 2) {
-    // old-style clock value (<= 2.8.2) -- by setting clock time and root number
-    // to 0 we guarantee that this is treated as a fresh instance
-    spec->tag = w_cs_clock;
-    spec->clock.start_time = 0;
-    spec->clock.pid = pid;
-    spec->clock.root_number = root_number;
-    spec->clock.ticks = ticks;
-    return spec;
-  }
-
-  free(spec);
-  return NULL;
-}
-
-// must be called with the root locked
-// spec can be null, in which case a fresh instance is assumed
-void w_clockspec_eval(w_root_t *root,
-    const struct w_clockspec *spec,
-    struct w_query_since *since)
-{
-  if (spec == NULL) {
-    since->is_timestamp = false;
-    since->clock.is_fresh_instance = true;
-    since->clock.ticks = 0;
-    return;
-  }
-
-  if (spec->tag == w_cs_timestamp) {
-    // just copy the values over
-    since->is_timestamp = true;
-    since->timestamp = spec->timestamp;
-    return;
-  }
-
-  since->is_timestamp = false;
-
-  if (spec->tag == w_cs_named_cursor) {
-    w_ht_val_t ticks_val;
-    w_string_t *cursor = spec->named_cursor.cursor;
-    since->clock.is_fresh_instance = !w_ht_lookup(root->cursors,
-                                                  w_ht_ptr_val(cursor),
-                                                  &ticks_val, false);
-    if (!since->clock.is_fresh_instance) {
-      since->clock.is_fresh_instance = ticks_val < root->last_age_out_tick;
-    }
-    if (since->clock.is_fresh_instance) {
-      since->clock.ticks = 0;
-    } else {
-      since->clock.ticks = (uint32_t)ticks_val;
-    }
-
-    // Bump the tick value and record it against the cursor.
-    // We need to bump the tick value so that repeated queries
-    // when nothing has changed in the filesystem won't continue
-    // to return the same set of files; we only want the first
-    // of these to return the files and the rest to return nothing
-    // until something subsequently changes
-    w_ht_replace(root->cursors, w_ht_ptr_val(cursor), ++root->ticks);
-
-    w_log(W_LOG_DBG, "resolved cursor %.*s -> %" PRIu32 "\n",
-        cursor->len, cursor->buf, since->clock.ticks);
-    return;
-  }
-
-  // spec->tag == w_cs_clock
-  if (spec->clock.start_time == proc_start_time &&
-      spec->clock.pid == proc_pid &&
-      spec->clock.root_number == root->number) {
-
-    since->clock.is_fresh_instance =
-      spec->clock.ticks < root->last_age_out_tick;
-    if (since->clock.is_fresh_instance) {
-      since->clock.ticks = 0;
-    } else {
-      since->clock.ticks = spec->clock.ticks;
-    }
-    if (spec->clock.ticks == root->ticks) {
-      /* Force ticks to increment.  This avoids returning and querying the
-       * same tick value over and over when no files have changed in the
-       * meantime */
-      root->ticks++;
-    }
-    return;
-  }
-
-  // If the pid, start time or root number don't match, they asked a different
-  // incarnation of the server or a different instance of this root, so we treat
-  // them as having never spoken to us before
-  since->clock.is_fresh_instance = true;
-  since->clock.ticks = 0;
-}
-
-void w_clockspec_free(struct w_clockspec *spec)
-{
-  if (spec->tag == w_cs_named_cursor) {
-    w_string_delref(spec->named_cursor.cursor);
-  }
-  free(spec);
-}
-
-void add_root_warnings_to_response(json_t *response, w_root_t *root) {
-  char *str = NULL;
-  char *full = NULL;
-
-  if (!root->last_recrawl_reason && !root->warning) {
-    return;
-  }
-
-  if (root->last_recrawl_reason) {
-    ignore_result(asprintf(&str,
-          "Recrawled this watch %d times, most recently because:\n"
-          "%.*s\n"
-          "To resolve, please review the information on\n"
-          "%s#recrawl",
-          root->recrawl_count,
-          root->last_recrawl_reason->len,
-          root->last_recrawl_reason->buf,
-          cfg_get_trouble_url()));
-  }
-
-  ignore_result(asprintf(&full,
-      "%.*s%s"   // root->warning
-      "%s\n"     // str (last recrawl reason)
-      "To clear this warning, run:\n"
-      "`watchman watch-del %.*s ; watchman watch-project %.*s`\n",
-      root->warning ? root->warning->len : 0,
-      root->warning ? root->warning->buf : "",
-      root->warning && str ? "\n" : "", // newline if we have both strings
-      str ? str : "",
-      root->root_path->len,
-      root->root_path->buf,
-      root->root_path->len,
-      root->root_path->buf));
-
-  if (full) {
-    set_prop(response, "warning", json_string_nocheck(full));
-  }
-  free(str);
-  free(full);
-}
-
-w_root_t *resolve_root_or_err(
-    struct watchman_client *client,
-    json_t *args,
-    int root_index,
-    bool create)
-{
-  w_root_t *root;
-  const char *root_name;
-  char *errmsg = NULL;
-  json_t *ele;
-
-  ele = json_array_get(args, root_index);
-  if (!ele) {
-    send_error_response(client, "wrong number of arguments");
-    return NULL;
-  }
-
-  root_name = json_string_value(ele);
-  if (!root_name) {
-    send_error_response(client,
-        "invalid value for argument %d, expected "
-        "a string naming the root dir",
-        root_index);
-    return NULL;
-  }
-
-  if (client->client_mode) {
-    root = w_root_resolve_for_client_mode(root_name, &errmsg);
-  } else {
-    root = w_root_resolve(root_name, create, &errmsg);
-  }
-
-  if (!root) {
-    send_error_response(client,
-        "unable to resolve root %s: %s",
-        root_name, errmsg);
-    free(errmsg);
-  }
-  return root;
-}
-
-static void cmd_shutdown(
-    struct watchman_client *client,
-    json_t *args)
-{
-  json_t *resp = make_response();
-  unused_parameter(args);
-
-  w_log(W_LOG_ERR, "shutdown-server was requested, exiting!\n");
+void w_request_shutdown(void) {
   stopping = true;
-
-  // Knock listener thread out of poll/accept
+// Knock listener thread out of poll/accept
 #ifndef _WIN32
   pthread_kill(listener_thread, SIGUSR1);
   pthread_kill(reaper_thread, SIGUSR1);
 #else
   SetEvent(listener_thread_event);
 #endif
-
-  set_prop(resp, "shutdown-server", json_true());
-  send_and_dispose_response(client, resp);
 }
-W_CMD_REG("shutdown-server", cmd_shutdown, CMD_DAEMON|CMD_POISON_IMMUNE, NULL)
 
 // The client thread reads and decodes json packets,
 // then dispatches the commands that it finds
@@ -441,6 +156,8 @@ static void *client_thread(void *ptr)
 
   w_stm_set_nonblock(client->stm, true);
   w_set_thread_name("client:stm=%p", client->stm);
+
+  client->client_is_owner = w_stm_peer_is_owner(client->stm);
 
   w_stm_get_events(client->stm, &pfd[0].evt);
   pfd[1].evt = client->ping;
@@ -580,43 +297,6 @@ void w_log_to_clients(int level, const char *buf)
   pthread_mutex_unlock(&w_client_lock);
 }
 
-static void *child_reaper(void *arg)
-{
-#ifndef _WIN32
-  sigset_t sigset;
-
-  // By default, keep both SIGCHLD and SIGUSR1 blocked
-  sigemptyset(&sigset);
-  sigaddset(&sigset, SIGUSR1);
-  sigaddset(&sigset, SIGCHLD);
-  pthread_sigmask(SIG_BLOCK, &sigset, NULL);
-
-  // SIGCHLD is ordinarily blocked, so we listen for it only in
-  // sigsuspend, when we're also listening for the SIGUSR1 that tells
-  // us to exit.
-  pthread_sigmask(SIG_BLOCK, NULL, &sigset);
-  sigdelset(&sigset, SIGCHLD);
-  sigdelset(&sigset, SIGUSR1);
-
-#endif
-  unused_parameter(arg);
-  w_set_thread_name("child_reaper");
-
-#ifdef _WIN32
-  while (!stopping) {
-    usleep(200000);
-    w_reap_children(true);
-  }
-#else
-  while (!stopping) {
-    w_reap_children(false);
-    sigsuspend(&sigset);
-  }
-#endif
-
-  return 0;
-}
-
 // This is just a placeholder.
 // This catches SIGUSR1 so we don't terminate.
 // We use this to interrupt blocking syscalls
@@ -636,72 +316,13 @@ static void wakeme(int signo)
 #include <sys/resource.h>
 #endif
 
-#ifdef __APPLE__
-/* When running under launchd, we prefer to obtain our listening
- * socket from it.  We don't strictly need to run this way, but if we didn't,
- * when the user runs `watchman shutdown-server` the launchd job is left in
- * a waiting state and needs to be explicitly triggered to get it working
- * again.
- * By having the socket registered in our job description, launchd knows
- * that we want to be activated in this way and takes care of it for us.
- *
- * This is made more fun because Yosemite introduces launch_activate_socket()
- * as a shortcut for this flow and deprecated pretty much everything else
- * in launch.h.  We use the deprecated functions so that we can run on
- * older releases.
- * */
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-static int get_listener_socket_from_launchd(void)
-{
-  launch_data_t req, resp, socks;
-
-  req = launch_data_new_string(LAUNCH_KEY_CHECKIN);
-  if (req == NULL) {
-    w_log(W_LOG_ERR, "unable to create LAUNCH_KEY_CHECKIN\n");
-    return -1;
-  }
-
-  resp = launch_msg(req);
-  launch_data_free(req);
-
-  if (resp == NULL) {
-    w_log(W_LOG_ERR, "launchd checkin failed %s\n", strerror(errno));
-    return -1;
-  }
-
-  if (launch_data_get_type(resp) == LAUNCH_DATA_ERRNO) {
-    w_log(W_LOG_ERR, "launchd checkin failed: %s\n",
-        strerror(launch_data_get_errno(resp)));
-    launch_data_free(resp);
-    return -1;
-  }
-
-  socks = launch_data_dict_lookup(resp, LAUNCH_JOBKEY_SOCKETS);
-  if (socks == NULL) {
-    w_log(W_LOG_ERR, "launchd didn't provide any sockets\n");
-    launch_data_free(resp);
-    return -1;
-  }
-
-  // the "sock" name here is coupled with the plist in main.c
-  socks = launch_data_dict_lookup(socks, "sock");
-  if (socks == NULL) {
-    w_log(W_LOG_ERR, "launchd: \"sock\" wasn't present in Sockets\n");
-    launch_data_free(resp);
-    return -1;
-  }
-
-  return launch_data_get_fd(launch_data_array_get_index(socks, 0));
-}
-#endif
-
 #ifndef _WIN32
 static int get_listener_socket(const char *path)
 {
   struct sockaddr_un un;
 
 #ifdef __APPLE__
-  listener_fd = get_listener_socket_from_launchd();
+  listener_fd = w_get_listener_socket_from_launchd();
   if (listener_fd != -1) {
     w_log(W_LOG_ERR, "Using socket from launchd as listening socket\n");
     return listener_fd;
@@ -751,7 +372,7 @@ static struct watchman_client *make_new_client(w_stm_t stm) {
   pthread_attr_init(&attr);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-  client = calloc(1, sizeof(*client));
+  client = calloc(1, derived_client_size);
   if (!client) {
     pthread_attr_destroy(&attr);
     return NULL;
@@ -769,7 +390,8 @@ static struct watchman_client *make_new_client(w_stm_t stm) {
   if (!client->ping) {
     // FIXME: error handling
   }
-  client->subscriptions = w_ht_new(2, &subscription_hash_funcs);
+
+  derived_client_ctor(client);
 
   pthread_mutex_lock(&w_client_lock);
   w_ht_set(clients, w_ht_ptr_val(client), w_ht_ptr_val(client));
@@ -938,7 +560,6 @@ bool w_start_listener(const char *path)
   sigset_t sigset;
 #endif
   void *ignored;
-  struct timeval tv;
 
   listener_thread = pthread_self();
 
@@ -1008,13 +629,6 @@ bool w_start_listener(const char *path)
   }
 #endif
 
-  proc_pid = (int)getpid();
-  if (gettimeofday(&tv, NULL) == -1) {
-    w_log(W_LOG_ERR, "gettimeofday failed: %s\n", strerror(errno));
-    return false;
-  }
-  proc_start_time = (uint64_t)tv.tv_sec;
-
 #ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
 
@@ -1038,17 +652,9 @@ bool w_start_listener(const char *path)
   w_set_cloexec(listener_fd);
 #endif
 
-  if (pthread_create(&reaper_thread, NULL, child_reaper, NULL)) {
-    w_log(W_LOG_FATAL, "pthread_create(reaper): %s\n",
-        strerror(errno));
-    return false;
-  }
-
   if (!clients) {
     clients = w_ht_new(2, NULL);
   }
-
-  w_state_load();
 
 #ifdef HAVE_LIBGIMLI_H
   if (hb) {
@@ -1100,13 +706,25 @@ bool w_start_listener(const char *path)
     } while (n_clients > 0);
   }
 
-  w_root_free_watched_roots();
-
   pthread_join(reaper_thread, &ignored);
   cfg_shutdown();
 
   return true;
 }
+
+/* get-pid */
+static void cmd_get_pid(struct watchman_client *client, json_t *args)
+{
+  json_t *resp = make_response();
+
+  unused_parameter(args);
+
+  set_prop(resp, "pid", json_integer(getpid()));
+
+  send_and_dispose_response(client, resp);
+}
+W_CMD_REG("get-pid", cmd_get_pid, CMD_DAEMON, NULL)
+
 
 /* vim:ts=2:sw=2:et:
  */

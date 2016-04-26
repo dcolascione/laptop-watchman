@@ -145,7 +145,7 @@ static bool time_generator(
       break;
     }
     if (!ctx->since.is_timestamp &&
-        f->otime.ticks < ctx->since.clock.ticks) {
+        f->otime.ticks <= ctx->since.clock.ticks) {
       break;
     }
 
@@ -378,12 +378,15 @@ bool w_query_execute(
     void *gendata)
 {
   struct w_query_ctx ctx;
+  w_perf_t sample;
 
   memset(&ctx, 0, sizeof(ctx));
   ctx.query = query;
   ctx.root = root;
 
   memset(res, 0, sizeof(*res));
+
+  w_perf_start(&sample, "query_execute");
 
   if (query->sync_timeout && !w_root_sync_to_now(root, query->sync_timeout)) {
     ignore_result(asprintf(&res->errmsg, "synchronization failed: %s\n",
@@ -403,7 +406,13 @@ bool w_query_execute(
    */
 
   // Lock the root and begin generation
-  w_root_lock(root);
+  if (!w_root_lock_with_timeout(root, "w_query_execute", query->lock_timeout)) {
+    ignore_result(asprintf(&res->errmsg, "couldn't acquire root lock within "
+                                         "lock_timeout of %dms. root is "
+                                         "currently busy (%s)\n",
+                           query->lock_timeout, root->lock_reason));
+    return false;
+  }
   res->root_number = root->number;
   res->ticks = root->ticks;
 
@@ -421,7 +430,17 @@ bool w_query_execute(
     generator(query, root, &ctx, gendata);
   }
 
+  if (w_perf_finish(&sample)) {
+    w_perf_add_root_meta(&sample, root);
+    w_perf_add_meta(&sample, "query_execute",
+                    json_pack("{s:b}",                                  //
+                              "fresh_instance", res->is_fresh_instance, //
+                              "num_results", ctx.num_results            //
+                              ));
+    w_perf_log(&sample);
+  }
   w_root_unlock(root);
+  w_perf_destroy(&sample);
 
   if (ctx.wholename) {
     w_string_delref(ctx.wholename);

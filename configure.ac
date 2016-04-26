@@ -1,4 +1,4 @@
-AC_INIT([watchman], [4.1.0], [], [watchman])
+AC_INIT([watchman], [4.5.0], [], [watchman])
 AC_CANONICAL_TARGET
 AM_INIT_AUTOMAKE([dist-bzip2 subdir-objects foreign])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES(yes)])
@@ -68,6 +68,40 @@ AC_ARG_WITH(statedir, [
                         and sockets instead of using your system tempdir.
                         Defaults to $WATCHMAN_STATE_DIR.  Override with
                         the WATCHMAN_STATE_DIR environment variable.
+xprefix=$prefix
+if test "$xprefix" = "NONE"; then
+  xprefix=$ac_default_prefix
+fi
+
+build_dev_fsevents=no
+AC_ARG_WITH(fsevents-header, [
+  --with-fsevents-header=/path/to/xnu/bsd/sys/fsevents.h
+                          Specify the path to the fsevents.h header file
+                          on your system.  This is an optional dependency
+                          for the experimental devfsevents watcher.
+],[
+  fsevents_header="$withval"
+  AC_MSG_CHECKING([that $fsevents_header is a file])
+  if test -f "$fsevents_header" ; then
+    AC_DEFINE_UNQUOTED(SYS_FSEVENTS_PATH, ["$fsevents_header"],[sys/fsevents.h location])
+    AC_MSG_RESULT(yes)
+    build_dev_fsevents=yes
+  else
+    AC_MSG_FAILURE([--with-fsevents-header was given but the value $fsevents_header was not a file])
+  fi
+])
+AM_CONDITIONAL(DEV_FSEVENTS, [test "$build_dev_fsevents" != "no"])
+
+xprefix=$prefix
+if test "$xprefix" = "NONE"; then
+  xprefix=$ac_default_prefix
+fi
+
+WATCHMAN_STATE_DIR="$xprefix/var/run/watchman"
+AC_ARG_ENABLE(statedir, [
+  --enable-statedir=PATH  Use PATH as the default for state, log files
+                          and sockets instead of using your system tempdir
+>>>>>>> 8f48ffbb3ab28c04f37b0a6e8676a5639dd46f45
 ],[
  WATCHMAN_STATE_DIR="$withval"
 ])
@@ -217,6 +251,7 @@ AC_SEARCH_LIBS([pthread_create], [pthread])
 AC_SEARCH_LIBS([socket], [socket])
 
 AC_CHECK_HEADERS(sys/types.h inttypes.h locale.h port.h sys/inotify.h sys/event.h)
+AC_CHECK_HEADERS(sys/ucred.h sys/socket.h)
 AC_CHECK_FUNCS(mkostemp kqueue port_create inotify_init strtoll localeconv statfs)
 AC_CHECK_FUNCS(accept4 inotify_init1 getattrlistbulk openat fdopendir)
 AC_CHECK_HEADERS(sys/vfs.h sys/param.h sys/mount.h sys/statfs.h sys/statvfs.h, [], [],
@@ -230,6 +265,7 @@ AC_CHECK_HEADERS(CoreServices/CoreServices.h, [
   LIBS="$LIBS -framework CoreServices"
 ])
 AC_CHECK_FUNCS(backtrace backtrace_symbols backtrace_symbols_fd)
+AC_CHECK_FUNCS(sys_siglist)
 
 if test -n "$ac_cv_header_sys_statvfs_h"; then
 AC_CHECK_MEMBERS([struct statvfs.f_fstypename,struct statvfs.f_basetype],

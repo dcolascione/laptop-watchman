@@ -5,8 +5,8 @@ import os
 import os.path
 import sys
 # Ensure that we can find pywatchman
-sys.path.append(os.path.join(os.getcwd(), 'python'))
-sys.path.append(os.path.join(os.getcwd(), 'tests', 'integration'))
+sys.path.insert(0, os.path.join(os.getcwd(), 'python'))
+sys.path.insert(0, os.path.join(os.getcwd(), 'tests', 'integration'))
 import tempfile
 import shutil
 import subprocess
@@ -57,9 +57,15 @@ parser.add_argument(
 
 parser.add_argument(
     '--concurrency',
-    default=int(math.ceil(1.5 * multiprocessing.cpu_count())),
+    default=int(min(8, math.ceil(1.5 * multiprocessing.cpu_count()))),
     type=int,
     help='How many tests to run at once')
+
+parser.add_argument(
+    '--watcher',
+    action='store',
+    default='auto',
+    help='Specify which watcher should be used to run the tests')
 
 args = parser.parse_args()
 
@@ -284,15 +290,18 @@ def runner():
     global results_queue
     global tests_queue
 
+    broken = False
     try:
         # Start up a shared watchman instance for the tests.
-        inst = WatchmanInstance.Instance()
+        inst = WatchmanInstance.Instance({
+            "watcher": args.watcher
+        })
         inst.start()
         # Allow tests to locate this default instance
         WatchmanInstance.setSharedInstance(inst)
     except Exception as e:
-        print('This is going to suck:', e)
-        return
+        print('while starting watchman: %s' % str(e))
+        broken = True
 
     while True:
         test = tests_queue.get()
@@ -300,7 +309,7 @@ def runner():
             if test == 'terminate':
                 break
 
-            if Interrupt.wasInterrupted():
+            if Interrupt.wasInterrupted() or broken:
                 continue
 
             try:
@@ -313,7 +322,8 @@ def runner():
         finally:
             tests_queue.task_done()
 
-    inst.stop()
+    if not broken:
+        inst.stop()
 
 def expand_suite(suite, target=None):
     """ recursively expand a TestSuite into a list of TestCase """
@@ -366,7 +376,12 @@ while not results_queue.empty():
 print('Ran %d, failed %d, skipped %d, concurrency %d' % (
     tests_run, tests_failed, tests_skipped, args.concurrency))
 
-if tests_failed:
+if 'APPVEYOR' in os.environ:
+    shutil.copytree(temp_dir, 'logs')
+    subprocess.call(['7z', 'a', 'logs.zip', 'logs'])
+    subprocess.call(['appveyor', 'PushArtifact', 'logs.zip'])
+
+if tests_failed or (tests_run == 0):
     if args.keep_if_fail:
         args.keep = True
     sys.exit(1)

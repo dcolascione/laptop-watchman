@@ -37,9 +37,9 @@ class movereaddTestCase extends WatchmanTestCase {
     mkdir("$root/foo/bar");
 
     $since = array('foo/bar');
-    if (PHP_OS == 'SunOS' || phutil_is_windows()) {
-      // This makes me sad, but Solaris reports the parent dir
-      // as changed when we mkdir within it
+    if (in_array($watch['watcher'], array('win32', 'portfs',
+        'kqueue'))) {
+      // the parent dir reflects as changed when we mkdir within it
       array_unshift($since, 'foo');
     }
 
@@ -53,11 +53,11 @@ class movereaddTestCase extends WatchmanTestCase {
     );
 
     $this->watchmanCommand('log', 'debug', 'XXX: rmdir foo/bar');
-    rmdir("$root/foo/bar");
+    w_rmdir_recursive("$root/foo/bar");
     $this->watchmanCommand('log', 'debug', 'XXX: unlink foo/222');
     unlink("$root/foo/222");
     $this->watchmanCommand('log', 'debug', 'XXX: rmdir foo');
-    rmdir("$root/foo");
+    w_rmdir_recursive("$root/foo");
 
     $this->assertFileListUsingSince($root, 'n:foo',
       array(

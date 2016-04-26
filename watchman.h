@@ -55,7 +55,7 @@ extern "C" {
 # define O_CLOEXEC 0
 #endif
 #ifndef _WIN32
-#include <sys/poll.h>
+#include <poll.h>
 #include <sys/wait.h>
 #endif
 #ifdef HAVE_PCRE_H
@@ -242,8 +242,6 @@ struct watchman_pending_fs;
 struct watchman_trigger_command;
 typedef struct watchman_root w_root_t;
 
-// Process global state for the selected watcher
-typedef void *watchman_global_watcher_t;
 // Per-watch state for the selected watcher
 typedef void *watchman_watcher_t;
 
@@ -296,8 +294,6 @@ struct watchman_dir {
   w_string_t *path;
   /* files contained in this dir (keyed by file->name) */
   w_ht_t *files;
-  /* files contained in this dir (keyed by lc(file->name)) */
-  w_ht_t *lc_files;
   /* child dirs contained in this dir (keyed by dir->path) */
   w_ht_t *dirs;
 };
@@ -314,63 +310,48 @@ struct watchman_ops {
 #define WATCHER_COALESCED_RENAME 2
   unsigned flags;
 
-  // Perform any global initialization needed for the watcher mechanism
-  // and return a context pointer that will be passed to all other ops
-  watchman_global_watcher_t (*global_init)(void);
-
-  // Perform global shutdown of the watcher at process shutdown time.
-  // We're not guaranteed that this will be called, depending on how
-  // the process is shutdown
-  void (*global_dtor)(watchman_global_watcher_t watcher);
-
   // Perform watcher-specific initialization for a watched root.
   // Do not start threads here
-  bool (*root_init)(watchman_global_watcher_t watcher, w_root_t *root,
-      char **errmsg);
+  bool (*root_init)(w_root_t *root, char **errmsg);
 
   // Start up threads or similar.  Called in the context of the
   // notify thread
-  bool (*root_start)(watchman_global_watcher_t watcher, w_root_t *root);
+  bool (*root_start)(w_root_t *root);
 
   // Perform watcher-specific cleanup for a watched root when it is freed
-  void (*root_dtor)(watchman_global_watcher_t watcher, w_root_t *root);
+  void (*root_dtor)(w_root_t *root);
 
   // Initiate an OS-level watch on the provided file
-  bool (*root_start_watch_file)(watchman_global_watcher_t watcher,
-      w_root_t *root, struct watchman_file *file);
+  bool (*root_start_watch_file)(w_root_t *root, struct watchman_file *file);
 
   // Cancel an OS-level watch on the provided file
-  void (*root_stop_watch_file)(watchman_global_watcher_t watcher,
-      w_root_t *root, struct watchman_file *file);
+  void (*root_stop_watch_file)(w_root_t *root, struct watchman_file *file);
 
   // Initiate an OS-level watch on the provided dir, return a DIR
   // handle, or NULL on error
   struct watchman_dir_handle *(*root_start_watch_dir)(
-      watchman_global_watcher_t watcher,
       w_root_t *root, struct watchman_dir *dir, struct timeval now,
       const char *path);
 
   // Cancel an OS-level watch on the provided dir
-  void (*root_stop_watch_dir)(watchman_global_watcher_t watcher,
-      w_root_t *root, struct watchman_dir *dir);
+  void (*root_stop_watch_dir)(w_root_t *root, struct watchman_dir *dir);
 
   // Signal any threads to terminate.  Do not join them here.
-  void (*root_signal_threads)(watchman_global_watcher_t watcher,
-      w_root_t *root);
+  void (*root_signal_threads)(w_root_t *root);
 
   // Consume any available notifications.  If there are none pending,
   // does not block.
-  bool (*root_consume_notify)(watchman_global_watcher_t watcher,
-      w_root_t *root, struct watchman_pending_collection *coll);
+  bool (*root_consume_notify)(w_root_t *root,
+      struct watchman_pending_collection *coll);
 
   // Wait for an inotify event to become available
-  bool (*root_wait_notify)(watchman_global_watcher_t watcher,
-      w_root_t *root, int timeoutms);
+  bool (*root_wait_notify)(w_root_t *root, int timeoutms);
 
   // Called when freeing a file node
-  void (*file_free)(watchman_global_watcher_t watcher,
-      struct watchman_file *file);
+  void (*file_free)(struct watchman_file *file);
 };
+
+bool w_watcher_init(w_root_t *root, char **errmsg);
 
 struct watchman_stat {
   struct timespec atime, mtime, ctime;
@@ -452,6 +433,7 @@ struct watchman_root {
 
   /* our locking granularity is per-root */
   pthread_mutex_t lock;
+  const char *lock_reason;
   pthread_t notify_thread;
   pthread_t io_thread;
 
@@ -489,6 +471,13 @@ struct watchman_root {
   /* queue of items that we need to stat/process */
   struct watchman_pending_collection pending;
 
+  // map of state name => watchman_client_state_assertion for
+  // asserted states
+  w_ht_t *asserted_states;
+
+  /* the watcher that we're using for this root */
+  struct watchman_ops *watcher_ops;
+
   /* --- everything below this point will be reset on w_root_init --- */
   bool _init_sentinel_;
 
@@ -525,6 +514,7 @@ struct watchman_root {
   uint32_t pending_trigger_tick;
   uint32_t pending_sub_tick;
   uint32_t last_age_out_tick;
+  uint32_t last_recheck_tick;
   time_t last_age_out_timestamp;
   time_t last_cmd_timestamp;
   time_t last_reap_timestamp;
@@ -572,23 +562,59 @@ struct watchman_client_response {
 
 struct watchman_client_subscription;
 
+struct watchman_client_state_assertion {
+  w_root_t *root; // Holds a ref on the root
+  w_string_t *name;
+  long id;
+};
+
+#include "watchman_perf.h"
+
 struct watchman_client {
   w_stm_t stm;
   w_evt_t ping;
   int log_level;
   w_jbuffer_t reader, writer;
   bool client_mode;
+  bool client_is_owner;
   enum w_pdu_type pdu_type;
 
+  // The command currently being processed by dispatch_command
+  json_t *current_command;
+  w_perf_t perf_sample;
+
   struct watchman_client_response *head, *tail;
+};
+
+// These are approximations for managing derived client "classes"
+extern void derived_client_dtor(struct watchman_client *client);
+extern void derived_client_ctor(struct watchman_client *client);
+extern const uint32_t derived_client_size;
+
+// Represents the server side session maintained for a client of
+// the watchman per-user process
+struct watchman_user_client {
+  struct watchman_client client;
+
   /* map of subscription name => struct watchman_client_subscription */
   w_ht_t *subscriptions;
+
+  /* map of unique id => watchman_client_state_assertion */
+  w_ht_t *states;
+  long next_state_id;
 };
+
 extern pthread_mutex_t w_client_lock;
 extern w_ht_t *clients;
+void w_client_lock_init(void);
+
+void w_client_vacate_states(struct watchman_user_client *client);
 
 void w_mark_dead(pid_t pid);
 bool w_reap_children(bool block);
+void w_start_reaper(void);
+bool w_is_stopping(void);
+extern pthread_t reaper_thread;
 
 #define W_LOG_OFF 0
 #define W_LOG_ERR 1
@@ -609,6 +635,7 @@ void w_log(int level, WATCHMAN_FMT_STRING(const char *fmt), ...)
   __attribute__((format(printf, 2, 3)))
 #endif
 ;
+void w_request_shutdown(void);
 
 bool w_should_log_to_clients(int level);
 void w_log_to_clients(int level, const char *buf);
@@ -618,6 +645,7 @@ void w_timeoutms_to_abs_timespec(int timeoutms, struct timespec *deadline);
 
 json_t *w_string_to_json(w_string_t *str);
 w_string_t *w_string_new(const char *str);
+w_string_t *w_string_new_len(const char *str, uint32_t len);
 #ifdef _WIN32
 w_string_t *w_string_new_wchar(WCHAR *str, int len);
 #endif
@@ -642,6 +670,8 @@ void w_string_in_place_normalize_separators(w_string_t **str, char target_sep);
 w_string_t *w_string_normalize_separators(w_string_t *str, char target_sep);
 w_string_t *w_string_path_cat(w_string_t *parent, w_string_t *rhs);
 w_string_t *w_string_path_cat_cstr(w_string_t *parent, const char *rhs);
+w_string_t *w_string_path_cat_cstr_len(w_string_t *parent, const char *rhs,
+                                       uint32_t rhs_len);
 bool w_string_startswith(w_string_t *str, w_string_t *prefix);
 bool w_string_startswith_caseless(w_string_t *str, w_string_t *prefix);
 w_string_t *w_string_shell_escape(const w_string_t *str);
@@ -686,7 +716,9 @@ void w_root_mark_file_changed(w_root_t *root, struct watchman_file *file,
 
 bool w_root_sync_to_now(w_root_t *root, int timeoutms);
 
-void w_root_lock(w_root_t *root);
+void w_root_lock(w_root_t *root, const char *purpose);
+bool w_root_lock_with_timeout(w_root_t *root, const char *purpose,
+                              int timeoutms);
 void w_root_unlock(w_root_t *root);
 
 /* Bob Jenkins' lookup3.c hash function */
@@ -733,9 +765,10 @@ struct w_query_since {
 };
 
 void w_run_subscription_rules(
-    struct watchman_client *client,
+    struct watchman_user_client *client,
     struct watchman_client_subscription *sub,
     w_root_t *root);
+void w_cancel_subscriptions_for_root(w_root_t *root);
 
 void w_match_results_free(uint32_t num_matches,
     struct watchman_rule_match *matches);
@@ -814,6 +847,19 @@ static inline void w_timeval_to_timespec(
   ts->tv_nsec = a.tv_usec * WATCHMAN_NSEC_IN_USEC;
 }
 
+static inline void w_timespec_to_timeval(
+    const struct timespec ts, struct timeval *tv) {
+  tv->tv_sec = ts.tv_sec;
+  tv->tv_usec = ts.tv_nsec / WATCHMAN_NSEC_IN_USEC;
+}
+
+// Convert a timeval to a double that holds the fractional number of seconds
+static inline double w_timeval_abs_seconds(struct timeval tv){
+  double val = (double)tv.tv_sec;
+  val += ((double)tv.tv_usec)/WATCHMAN_USEC_IN_SEC;
+  return val;
+}
+
 static inline double w_timeval_diff(struct timeval start, struct timeval end)
 {
   double s = start.tv_sec + ((double)start.tv_usec)/WATCHMAN_USEC_IN_SEC;
@@ -832,6 +878,9 @@ bool w_root_load_state(json_t *state);
 json_t *w_root_trigger_list_to_json(w_root_t *root);
 json_t *w_root_watch_list_to_json(void);
 
+#ifdef __APPLE__
+int w_get_listener_socket_from_launchd(void);
+#endif
 bool w_start_listener(const char *socket_path);
 void w_check_my_sock(void);
 char **w_argv_copy_from_json(json_t *arr, int skip);
@@ -885,6 +934,12 @@ struct watchman_getopt {
 # define MAX(a, b)  (a) > (b) ? (a) : (b)
 #endif
 
+#ifdef HAVE_SYS_SIGLIST
+# define w_strsignal(val) sys_siglist[(val)]
+#else
+# define w_strsignal(val) strsignal((val))
+#endif
+
 bool w_getopt(struct watchman_getopt *opts, int *argcp, char ***argvp,
     char ***daemon_argv);
 void usage(struct watchman_getopt *opts, FILE *where);
@@ -896,6 +951,7 @@ void w_clockspec_eval(w_root_t *root,
     const struct w_clockspec *spec,
     struct w_query_since *since);
 void w_clockspec_free(struct w_clockspec *spec);
+void w_clockspec_init(void);
 
 const char *get_sock_name(void);
 
@@ -927,6 +983,8 @@ struct watchman_client_subscription {
   bool vcs_defer;
   uint32_t last_sub_tick;
   struct w_query_field_list field_list;
+  // map of statename => bool.  If true, policy is drop, else defer
+  w_ht_t *drop_or_defer;
 };
 
 struct watchman_trigger_command {
@@ -965,13 +1023,12 @@ void set_poison_state(w_root_t *root, w_string_t *dir,
     const char *reason);
 
 void watchman_watcher_init(void);
-void watchman_watcher_dtor(void);
 void handle_open_errno(w_root_t *root, struct watchman_dir *dir,
     struct timeval now, const char *syscall, int err,
     const char *reason);
 void stop_watching_dir(w_root_t *root, struct watchman_dir *dir);
-DIR *opendir_nofollow(const char *path);
-uint32_t u32_strlen(const char *str);
+uint32_t strlen_uint32(const char *str);
+int w_lstat(const char *path, struct stat *st, bool case_sensitive);
 
 extern struct watchman_ops fsevents_watcher;
 extern struct watchman_ops kqueue_watcher;
@@ -988,6 +1045,10 @@ struct flag_map {
 };
 void w_expand_flags(const struct flag_map *fmap, uint32_t flags,
     char *buf, size_t len);
+
+#ifdef __APPLE__
+int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *ts);
+#endif
 
 #ifdef __cplusplus
 }

@@ -66,14 +66,15 @@ static void cmd_clock(struct watchman_client *client, json_t *args)
   }
 
   resp = make_response();
-  w_root_lock(root);
+  w_root_lock(root, "clock");
   annotate_with_clock(root, resp);
   w_root_unlock(root);
 
   send_and_dispose_response(client, resp);
   w_root_delref(root);
 }
-W_CMD_REG("clock", cmd_clock, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("clock", cmd_clock, CMD_DAEMON | CMD_ALLOW_ANY_USER,
+          w_cmd_realpath_root)
 
 /* watch-del /root
  * Stops watching the specified root */
@@ -129,7 +130,7 @@ static void cmd_watch_list(struct watchman_client *client, json_t *args)
   set_prop(resp, "roots", root_paths);
   send_and_dispose_response(client, resp);
 }
-W_CMD_REG("watch-list", cmd_watch_list, CMD_DAEMON, NULL)
+W_CMD_REG("watch-list", cmd_watch_list, CMD_DAEMON | CMD_ALLOW_ANY_USER, NULL)
 
 // For each directory component in candidate_dir to the root of the filesystem,
 // look for root_file.  If root_file is present, update relpath to reflect the
@@ -307,20 +308,22 @@ static void cmd_watch(struct watchman_client *client, json_t *args)
 
   resp = make_response();
 
-  w_root_lock(root);
+  w_root_lock(root, "watch");
   if (root->failure_reason) {
     set_prop(resp, "error", w_string_to_json(root->failure_reason));
   } else if (root->cancelled) {
     set_prop(resp, "error", json_string_nocheck("root was cancelled"));
   } else {
     set_prop(resp, "watch", w_string_to_json(root->root_path));
+    set_prop(resp, "watcher", json_string_nocheck(root->watcher_ops->name));
   }
   add_root_warnings_to_response(resp, root);
   send_and_dispose_response(client, resp);
   w_root_unlock(root);
   w_root_delref(root);
 }
-W_CMD_REG("watch", cmd_watch, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("watch", cmd_watch, CMD_DAEMON | CMD_ALLOW_ANY_USER,
+          w_cmd_realpath_root)
 
 static void cmd_watch_project(struct watchman_client *client, json_t *args)
 {
@@ -354,13 +357,14 @@ static void cmd_watch_project(struct watchman_client *client, json_t *args)
 
   resp = make_response();
 
-  w_root_lock(root);
+  w_root_lock(root, "watch-project");
   if (root->failure_reason) {
     set_prop(resp, "error", w_string_to_json(root->failure_reason));
   } else if (root->cancelled) {
     set_prop(resp, "error", json_string_nocheck("root was cancelled"));
   } else {
     set_prop(resp, "watch", w_string_to_json(root->root_path));
+    set_prop(resp, "watcher", json_string_nocheck(root->watcher_ops->name));
   }
   add_root_warnings_to_response(resp, root);
   if (rel_path_from_watch) {
@@ -372,7 +376,8 @@ static void cmd_watch_project(struct watchman_client *client, json_t *args)
   w_root_delref(root);
   free(dir_to_watch);
 }
-W_CMD_REG("watch-project", cmd_watch_project, CMD_DAEMON, w_cmd_realpath_root)
+W_CMD_REG("watch-project", cmd_watch_project, CMD_DAEMON | CMD_ALLOW_ANY_USER,
+          w_cmd_realpath_root)
 
 /* vim:ts=2:sw=2:et:
  */

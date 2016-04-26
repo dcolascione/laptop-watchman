@@ -109,7 +109,7 @@ microseconds, nanoseconds or floating point seconds respectively.
 
 ### Synchronization timeout (since 2.1)
 
-By default a `query` will wait for up to 2 seconds for the view of the
+By default a `query` will wait for up to 60 seconds for the view of the
 filesystem to become current.  Watchman decides that the view is current by
 creating a cookie file and waiting to observe the notification that it is
 present.  If the cookie is not observed within the sync_timeout period then the
@@ -123,10 +123,33 @@ expressed in milliseconds:
 ["query", "/path/to/root", {
   "expression": ["exists"],
   "fields": ["name"],
-  "sync_timeout": 2000
+  "sync_timeout": 60000
 }]
 ```
 
 You may specify `0` as the value if you do not wish for the query to create
 a cookie and synchronize; the query will be evaluated over the present view
 of the tree, which may lag behind the present state of the filesystem.
+
+### Lock timeout
+
+*Since 4.6.*
+
+By default queries will wait for up to 60 seconds to acquire a lock to inspect
+the view of the filesystem tree.  In practice, this timeout should never be hit
+(it is indicative of an environmental or load related issue).  However, in some
+situations it is important to ensure that the query attempt times out sooner
+than this.  You may use the `lock_timeout` field to control this behavior.
+`lock_timeout` must be an integer value expressed in milliseconds:
+
+```json
+["query", "/path/to/root", {
+  "expression": ["exists"],
+  "fields": ["name"],
+  "lock_timeout": 60000,
+  "sync_timeout": 60000
+}]
+```
+
+Prior to version 4.6, the `lock_timeout` could not be configured and had an
+effective value of infinity.

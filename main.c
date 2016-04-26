@@ -79,8 +79,11 @@ static void run_service(void)
   }
 
   watchman_watcher_init();
+  w_clockspec_init();
+  w_state_load();
+  w_start_reaper();
   res = w_start_listener(sock_name);
-  watchman_watcher_dtor();
+  w_root_free_watched_roots();
 
   if (res) {
     exit(0);
@@ -348,7 +351,7 @@ static void spawn_via_launchd(void)
 "        <true/>\n"
 "    </dict>\n"
 "    <key>RunAtLoad</key>\n"
-"    <false/>\n"
+"    <true/>\n"
 "    <key>EnvironmentVariables</key>\n"
 "    <dict>\n"
 "        <key>PATH</key>\n"
@@ -835,13 +838,8 @@ int main(int argc, char **argv)
 {
   bool ran;
   json_t *cmd;
-  pthread_mutexattr_t mattr;
 
-  pthread_mutexattr_init(&mattr);
-  pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
-  pthread_mutex_init(&w_client_lock, &mattr);
-  pthread_mutexattr_destroy(&mattr);
-
+  w_client_lock_init();
   parse_cmdline(&argc, &argv);
 
   if (foreground) {
